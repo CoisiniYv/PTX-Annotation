@@ -12,10 +12,19 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from constants import (
+    JPEG_EXTENSIONS,
+    MASK_IMAGE_EXTENSIONS,
+    NIFTI_EXTENSIONS,
+    PNG_COMPRESSION_MAX,
+    QUALITY_MAX,
+    QUALITY_MIN,
+)
+
 def smart_read_image(path: str) -> np.ndarray | None:
     try:
         ext = os.path.splitext(path)[1].lower()
-        if ext in {".png", ".jpg", ".jpeg", ".bmp"}:
+        if ext in MASK_IMAGE_EXTENSIONS:
             return imread_unicode(path)
         result = read_dicom_with_window(path)
         if result:
@@ -118,11 +127,11 @@ def imwrite_with_quality(path: str, img: np.ndarray, quality: int) -> bool:
         if not ext:
             ext = ".png"
         params = []
-        if ext in {".jpg", ".jpeg"}:
-            q = int(max(1, min(100, quality)))
+        if ext in JPEG_EXTENSIONS:
+            q = int(max(QUALITY_MIN, min(QUALITY_MAX, quality)))
             params = [cv2.IMWRITE_JPEG_QUALITY, q]
         elif ext == ".png":
-            q = int(max(1, min(100, quality)))
+            q = int(max(QUALITY_MIN, min(QUALITY_MAX, quality)))
             compression = int(round((100 - q) / 100 * 9))
             compression = max(0, min(9, compression))
             params = [cv2.IMWRITE_PNG_COMPRESSION, compression]
@@ -135,8 +144,6 @@ def imwrite_with_quality(path: str, img: np.ndarray, quality: int) -> bool:
         return False
 
 
-MASK_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
-MASK_NIFTI_EXTENSIONS = (".nii", ".nii.gz")
 
 
 def _resize_mask_if_needed(mask: np.ndarray, target_shape: tuple[int, int] | None):
@@ -345,7 +352,7 @@ def read_mask_file(
         mask = _resize_mask_if_needed(mask, target_shape)
         return np.ascontiguousarray(mask), None
 
-    if ext.endswith(MASK_NIFTI_EXTENSIONS):
+    if ext.endswith(NIFTI_EXTENSIONS):
         return _read_nifti_mask_aligned(
             path,
             target_shape=target_shape,
@@ -353,6 +360,10 @@ def read_mask_file(
         )
 
     return None, "不支持的掩码格式"
+
+
+def binarize_mask(mask: np.ndarray, threshold: int | float) -> np.ndarray:
+    return (np.asarray(mask) >= threshold).astype(np.uint8) * 255
 
 
 def natural_sort_key(s: str):
@@ -499,7 +510,7 @@ def write_mask_file(
         return True, None
 
     # NIfTI 格式
-    if ext.endswith(MASK_NIFTI_EXTENSIONS):
+    if ext.endswith(NIFTI_EXTENSIONS):
         try:
             out_img = sitk.GetImageFromArray(mask_bin.astype(np.uint8))
         except Exception as e:

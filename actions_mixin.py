@@ -7,6 +7,7 @@ import uuid
 
 import cv2
 import numpy as np
+import SimpleITK as sitk
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QDialog, QFileDialog, QListWidgetItem, QMessageBox
@@ -63,6 +64,8 @@ class ActionsMixin:
         # [修复] 同步更新 entry.mask_path，确保 Ctrl+S / 自动保存
         # 写回与拖入相同格式的文件，而非写到旧的 .png 默认路径
         entry.mask_path = path
+        if hasattr(self, "_xray_dir_match_cache"):
+            self._xray_dir_match_cache.clear()
 
         fname = os.path.basename(path)
         self.statusBar().showMessage(f"已加载掩码: {fname}", 2000)
@@ -237,32 +240,200 @@ class ActionsMixin:
 
     def _get_nifti_export_reference_path(self, entry):
         ref = getattr(self, "_single_pair_source_mask_path", None)
-        if ref and str(ref).lower().endswith((".nii", ".nii.gz")):
+        if ref and str(ref).lower().endswith((".nii", ".nii.gz", ".dcm", ".dicom")):
             return ref
         orig = getattr(entry, "orig_path", None)
-        if orig and str(orig).lower().endswith((".nii", ".nii.gz")):
+        if orig and str(orig).lower().endswith((".nii", ".nii.gz", ".dcm", ".dicom")):
             return orig
         return None
+
+    def _source_is_dicom_for_export(self, entry):
+        orig = str(getattr(entry, "orig_path", "") or "").lower()
+        return orig.endswith((".dcm", ".dicom"))
+
+    def _mask_to_binary_uint8(self, mask, shape=None):
+        if mask is None:
+            if shape is None:
+                return np.zeros((1, 1), dtype=np.uint8)
+            return np.zeros(shape, dtype=np.uint8)
+
+        arr = np.asarray(mask)
+        if arr.size == 0:
+            if shape is None:
+                return np.zeros((1, 1), dtype=np.uint8)
+            return np.zeros(shape, dtype=np.uint8)
+
+        if arr.ndim == 0:
+            value = 255 if arr.item() > 0 else 0
+            if shape is None:
+                return np.asarray([[value]], dtype=np.uint8)
+            return np.full(shape, value, dtype=np.uint8)
+
+        if arr.ndim > 2:
+            arr = arr[..., 0]
+
+        arr = (arr > 0).astype(np.uint8) * 255
+        if shape is not None and arr.shape[:2] != tuple(shape):
+            arr = cv2.resize(
+                arr,
+                (int(shape[1]), int(shape[0])),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        return np.ascontiguousarray(arr)
+
+    def _read_reference_image_2d(self, reference_path):
+        tmp_dir = None
+        try:
+            try:
+                ref_img = sitk.ReadImage(reference_path)
+            except Exception:
+                if not reference_path or not os.path.exists(reference_path):
+                    raise
+                if not self._contains_non_ascii(reference_path):
+                    raise
+                tmp_dir = tempfile.mkdtemp(prefix="sitk_ascii_")
+                lower = reference_path.lower()
+                suffix = (
+                    ".nii.gz"
+                    if lower.endswith(".nii.gz")
+                    else os.path.splitext(reference_path)[1] or ".nii"
+                )
+                tmp_path = os.path.join(tmp_dir, "ref" + suffix)
+                shutil.copy2(reference_path, tmp_path)
+                ref_img = sitk.ReadImage(tmp_path)
+
+            dim = ref_img.GetDimension()
+            if dim == 2:
+                return ref_img, tmp_dir
+            if dim == 3:
+                size = list(ref_img.GetSize())
+                singleton_axes = [i for i, s in enumerate(size) if s == 1]
+                if len(singleton_axes) == 1:
+                    axis = singleton_axes[0]
+                    extract_size = list(size)
+                    extract_index = [0, 0, 0]
+                    extract_size[axis] = 0
+                    ref_img = sitk.Extract(ref_img, extract_size, extract_index)
+                    return ref_img, tmp_dir
+            raise ValueError(
+                f"参考图像维度不支持: dimension={dim}, size={tuple(ref_img.GetSize())}"
+            )
+        except Exception:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
+
+    def _write_nifti_array_compat(
+        self,
+        save_path,
+        arr,
+        reference_image_path=None,
+        binary=False,
+    ):
+        try:
+            out_arr = np.asarray(arr)
+        except Exception as e:
+            return False, f"导出数组无效: {e}"
+
+        if out_arr.ndim == 3:
+            if out_arr.shape[2] == 4:
+                out_arr = cv2.cvtColor(out_arr, cv2.COLOR_BGRA2GRAY)
+            elif out_arr.shape[2] == 3:
+                out_arr = cv2.cvtColor(out_arr, cv2.COLOR_BGR2GRAY)
+            else:
+                out_arr = out_arr[:, :, 0]
+
+        if out_arr.ndim != 2:
+            return False, f"当前仅支持导出 2D NIfTI，实际数组形状为 {out_arr.shape}"
+
+        out_arr = np.ascontiguousarray(out_arr)
+        if binary:
+            out_arr = (out_arr > 0).astype(np.uint8)
+        elif out_arr.dtype == np.bool_:
+            out_arr = out_arr.astype(np.uint8)
+        elif not np.issubdtype(out_arr.dtype, np.number):
+            out_arr = out_arr.astype(np.float32)
+        else:
+            out_arr = out_arr.astype(
+                np.float32 if np.issubdtype(out_arr.dtype, np.floating) else out_arr.dtype,
+                copy=False,
+            )
+
+        try:
+            out_img = sitk.GetImageFromArray(out_arr)
+        except Exception as e:
+            return False, f"创建 NIfTI 图像失败: {e}"
+
+        ref_tmp_dir = None
+        if reference_image_path:
+            try:
+                ref_img, ref_tmp_dir = self._read_reference_image_2d(reference_image_path)
+                if tuple(ref_img.GetSize()) == (out_arr.shape[1], out_arr.shape[0]):
+                    out_img.CopyInformation(ref_img)
+            except Exception:
+                pass
+            finally:
+                if ref_tmp_dir:
+                    shutil.rmtree(ref_tmp_dir, ignore_errors=True)
+
+        if not self._contains_non_ascii(save_path):
+            try:
+                sitk.WriteImage(out_img, save_path)
+                return True, None
+            except Exception as e:
+                return False, f"写入 NIfTI 失败: {e}"
+
+        temp_root = self._get_ascii_temp_root()
+        if not temp_root:
+            try:
+                sitk.WriteImage(out_img, save_path)
+                return True, None
+            except Exception as e:
+                return False, f"写入 NIfTI 失败: {e}"
+
+        temp_dir = os.path.join(temp_root, "xray_nifti_ascii_tmp")
+        try:
+            os.makedirs(temp_dir, exist_ok=True)
+        except Exception:
+            try:
+                sitk.WriteImage(out_img, save_path)
+                return True, None
+            except Exception as e:
+                return False, f"写入 NIfTI 失败: {e}"
+
+        suffix = ".nii.gz" if str(save_path).lower().endswith(".nii.gz") else ".nii"
+        temp_path = os.path.join(
+            temp_dir,
+            f"img_{os.getpid()}_{uuid.uuid4().hex}{suffix}",
+        )
+
+        try:
+            sitk.WriteImage(out_img, temp_path)
+            save_dir = os.path.dirname(save_path)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            if os.path.exists(save_path):
+                os.remove(save_path)
+            shutil.move(temp_path, save_path)
+            return True, None
+        except Exception as e:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            return False, f"写入 NIfTI 失败: {e}"
 
     def _export_image_file(self, out_path, img, quality, reference_mask_path=None):
         lower_path = (out_path or "").lower()
         if lower_path.endswith((".nii", ".nii.gz")):
-            export_img = img
-            if export_img is None:
+            if img is None:
                 return False, "导出图像为空"
-
-            if export_img.ndim == 3:
-                if export_img.shape[2] == 4:
-                    export_img = cv2.cvtColor(export_img, cv2.COLOR_BGRA2GRAY)
-                elif export_img.shape[2] == 3:
-                    export_img = cv2.cvtColor(export_img, cv2.COLOR_BGR2GRAY)
-                else:
-                    export_img = export_img[:, :, 0]
-
-            return self._write_mask_file_compat(
+            return self._write_nifti_array_compat(
                 out_path,
-                export_img,
-                reference_mask_path=reference_mask_path,
+                img,
+                reference_image_path=reference_mask_path,
+                binary=False,
             )
 
         ok = imwrite_with_quality(out_path, img, quality)
@@ -278,9 +449,7 @@ class ActionsMixin:
             return
 
         entry = self.entries[self.current_idx]
-        mask_to_save = (self.canvas.mask >= self.canvas.display_threshold).astype(
-            np.uint8
-        ) * 255
+        mask_to_save = self._mask_to_binary_uint8(self.canvas.mask)
 
         save_path = entry.mask_path
 
@@ -356,6 +525,8 @@ class ActionsMixin:
         if ok:
             entry.mask_path = save_path
             entry.has_mask = True
+            if hasattr(self, "_xray_dir_match_cache"):
+                self._xray_dir_match_cache.clear()
             # [修复] 仅在单对/快速预览模式下更新 mask_root。
             # 批量模式的 mask_root 由 select_mask_dir / load_task_json 设定，
             # 不应被单次保存的子目录覆盖，否则后续其他病例的 p_mask 拼接会全部错误。
@@ -457,14 +628,7 @@ class ActionsMixin:
             
         case_name = os.path.basename(dicom_path)
         filename = os.path.basename(dicom_path)
-        lower_mask = mask_path.lower()
-        if lower_mask.endswith(".nii") or lower_mask.endswith(".nii.gz"):
-            base = os.path.splitext(filename)[0]
-            export_mask_path = os.path.join(
-                os.path.dirname(dicom_path), f"{base}_mask.png"
-            )
-        else:
-            export_mask_path = mask_path
+        export_mask_path = mask_path
         self.mask_root = os.path.dirname(export_mask_path)
 
         entry = ImageEntry(
@@ -652,41 +816,46 @@ class ActionsMixin:
 
         fmt = (fmt or "png").lower()
         out_path = self._ensure_export_path_ext(out_path, fmt)
-
-        img = cv2.resize(
-            self.canvas.base_img, (out_w, out_h), interpolation=cv2.INTER_AREA
-        )
-
-        if invert_export:
-            img = cv2.bitwise_not(img)
-
-        # export_current 是“导出当前显示结果”，允许任意改宽高。
-        # 这里如果继续继承原始 NIfTI 参考信息，容易让写出的体信息与 resize 后的二维数组打架，
-        # 导致外部查看时尺寸/spacing 表现异常。因此导出 NIfTI 时按当前数组直接写出，
-        # 不再复用原始参考；真正需要保留原始空间信息的场景仍走 save_mask()。
-        reference_mask_path = None
-
-        ok, err = self._export_image_file(
-            out_path,
-            img,
-            quality,
-            reference_mask_path=reference_mask_path,
-        )
-        if not ok:
-            QMessageBox.warning(self, "错误", err or "导出图像失败")
-            return
-
-        mask = self.canvas.mask
-        if mask is None:
-            mask = np.zeros((h, w), dtype=np.uint8)
-        else:
-            mask = (mask >= self.canvas.display_threshold).astype(np.uint8) * 255
-
-        mask = cv2.resize(mask, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
-
-        mask_path = self._get_export_mask_path(out_path, fmt)
+        source_is_dicom = self._source_is_dicom_for_export(entry)
 
         if fmt == "nii":
+            # NIfTI 导出应保持当前底层矩阵大小，不能沿用“任意缩放导出”的位图逻辑。
+            img = self.canvas.base_img.copy()
+            if invert_export:
+                img = cv2.bitwise_not(img)
+
+            mask = self._mask_to_binary_uint8(self.canvas.mask, shape=(h, w))
+            reference_mask_path = self._get_nifti_export_reference_path(entry)
+        else:
+            img = cv2.resize(
+                self.canvas.base_img, (out_w, out_h), interpolation=cv2.INTER_AREA
+            )
+
+            if invert_export:
+                img = cv2.bitwise_not(img)
+
+            mask = self._mask_to_binary_uint8(self.canvas.mask, shape=(h, w))
+            mask = cv2.resize(mask, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+            mask = self._mask_to_binary_uint8(mask, shape=(out_h, out_w))
+            reference_mask_path = None
+
+        exported_paths = []
+        should_export_image = not (fmt == "nii" and source_is_dicom)
+
+        if should_export_image:
+            ok, err = self._export_image_file(
+                out_path,
+                img,
+                quality,
+                reference_mask_path=reference_mask_path,
+            )
+            if not ok:
+                QMessageBox.warning(self, "错误", err or "导出图像失败")
+                return
+            exported_paths.append(os.path.basename(out_path))
+
+        if fmt == "nii":
+            mask_path = out_path if source_is_dicom else self._get_export_mask_path(out_path, fmt)
             ok, err = self._write_mask_file_compat(
                 mask_path,
                 mask,
@@ -695,13 +864,16 @@ class ActionsMixin:
             if not ok:
                 QMessageBox.warning(self, "错误", err or "导出掩码失败")
                 return
+            exported_paths.append(os.path.basename(mask_path))
         else:
+            mask_path = self._get_export_mask_path(out_path, fmt)
             if not imwrite_unicode(mask_path, mask):
                 QMessageBox.warning(self, "错误", "导出掩码失败")
                 return
+            exported_paths.append(os.path.basename(mask_path))
 
         self.statusBar().showMessage(
-            f"已导出: {os.path.basename(out_path)} / {os.path.basename(mask_path)}",
+            "已导出: " + " / ".join(exported_paths),
             2000,
         )
 

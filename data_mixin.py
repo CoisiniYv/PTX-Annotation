@@ -3,6 +3,7 @@
 import json
 import os
 import queue
+import re
 import threading
 
 import cv2
@@ -19,6 +20,20 @@ from PySide6.QtWidgets import (
 )
 
 from models import ImageEntry, ScanMode
+from constants import (
+    CT_MASK_CANDIDATE_SUFFIXES,
+    CT_SOURCE_EXTENSIONS,
+    DEFAULT_MASK_BITMAP_EXT,
+    DEFAULT_NIFTI_EXT,
+    MASK_FILE_EXTENSIONS,
+    NIFTI_EXTENSIONS,
+    XRAY_IGNORED_SOURCE_EXTENSIONS,
+    XRAY_MASK_CANDIDATE_EXTENSIONS,
+    default_mask_path,
+    endswith_any,
+    split_known_image_ext,
+    strip_known_image_ext,
+)
 from utils import (
     imread_unicode,
     is_dual_folder_mode,
@@ -133,6 +148,13 @@ class DataMixin:
                 return val
         return None
 
+    def _get_active_cache_max(self):
+        return (
+            self.ct_cache_max
+            if self.scan_mode == ScanMode.CT_SEQUENCE
+            else self.xray_cache_max
+        )
+
     def _cache_set(self, key, value):
         meta = None
         if len(value) == 3:
@@ -145,11 +167,7 @@ class DataMixin:
                 old_img, old_mask = cached_val[0], cached_val[1]
                 self._release_cache_entry(key, old_img, old_mask)
             self._image_cache[key] = (img, mask, meta)
-            active_max = (
-                self.ct_cache_max
-                if self.scan_mode == ScanMode.CT_SEQUENCE
-                else self.xray_cache_max
-            )
+            active_max = self._get_active_cache_max()
             while len(self._image_cache) > active_max:
                 old_key, cached_val = self._image_cache.popitem(last=False)
                 old_img, old_mask = cached_val[0], cached_val[1]
@@ -197,25 +215,180 @@ class DataMixin:
     @staticmethod
     def _split_compound_ext(path_str):
         lower = path_str.lower()
-        if lower.endswith(".nii.gz"):
-            return path_str[:-7], ".nii.gz"
-        return os.path.splitext(path_str)
+        return split_known_image_ext(path_str)
 
     @classmethod
     def _strip_compound_ext(cls, path_str):
-        return cls._split_compound_ext(path_str)[0]
+        return strip_known_image_ext(path_str)
 
     @staticmethod
     def _is_nifti_file(path_str):
-        lower = path_str.lower()
-        return lower.endswith(".nii") or lower.endswith(".nii.gz")
+        return endswith_any(path_str, NIFTI_EXTENSIONS)
+
+    @classmethod
+    def _get_xray_mask_stem(cls, path_str):
+        return os.path.basename(cls._strip_compound_ext(path_str or ""))
+
+    def _is_generic_xray_mask_name(self, filename):
+        stem = self._get_xray_mask_stem(filename).lower()
+        return bool(stem) and (
+            stem == "untitled"
+            or stem.startswith("untitled")
+            or re.fullmatch(r"\d+", stem) is not None
+        )
 
     def _is_xray_mask_sidecar(self, filename):
-        lower = filename.lower()
+        lower = os.path.basename(filename).lower()
+        stem = self._get_xray_mask_stem(lower).lower()
+        has_mask_ext = lower.endswith(MASK_FILE_EXTENSIONS)
+
+        # NIfTI 在当前项目里始终按掩码侧车处理
         if self._is_nifti_file(lower):
             return True
-        stem = os.path.splitext(os.path.basename(lower))[0]
-        return stem.endswith("_mask")
+
+        # 仅当文件本身就是常见掩码格式时，才把 _mask / Untitled / 纯数字 命名
+        # 视为侧车掩码；否则像“1”“2”这类无扩展名 DICOM 会被误排除，导致整目录扫不出来。
+        if has_mask_ext and stem.endswith("_mask"):
+            return True
+        if has_mask_ext and self._is_generic_xray_mask_name(lower):
+            return True
+        return False
+
+    def _iter_xray_source_filenames(self, dir_path):
+        if not dir_path or not os.path.isdir(dir_path):
+            return []
+
+        ignored_exts = XRAY_IGNORED_SOURCE_EXTENSIONS
+        try:
+            filenames = [
+                f for f in os.listdir(dir_path) if os.path.isfile(os.path.join(dir_path, f))
+            ]
+        except OSError:
+            return []
+
+        base_names = set()
+        for f in filenames:
+            ext = os.path.splitext(f)[1].lower()
+            if (
+                ext not in ignored_exts
+                and ext != ".png"
+                and not self._is_xray_mask_sidecar(f)
+            ):
+                base_names.add(os.path.splitext(f)[0])
+
+        result = []
+        for f in filenames:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in ignored_exts or self._is_xray_mask_sidecar(f):
+                continue
+            if ext == ".png" and os.path.splitext(f)[0] in base_names:
+                continue
+            result.append(f)
+
+        result.sort(key=natural_sort_key)
+        return result
+
+    def _build_xray_dir_mask_map(self, src_dir, rel_dir=""):
+        src_dir = os.path.normpath(src_dir or "")
+        if not src_dir or not os.path.isdir(src_dir):
+            return {}
+
+        dual_mode = is_dual_folder_mode(self.orig_root, self.mask_root)
+        mask_dir = (
+            os.path.normpath(os.path.join(self.mask_root, rel_dir))
+            if dual_mode and self.mask_root
+            else src_dir
+        )
+        cache_key = (src_dir, mask_dir)
+        cache = getattr(self, "_xray_dir_match_cache", None)
+        if cache is None:
+            cache = {}
+            self._xray_dir_match_cache = cache
+        if cache_key in cache:
+            return dict(cache[cache_key])
+
+        source_filenames = self._iter_xray_source_filenames(src_dir)
+        if not source_filenames:
+            cache[cache_key] = {}
+            return {}
+
+        mapping = {}
+        used_masks = set()
+        exact_exts = list(XRAY_MASK_CANDIDATE_EXTENSIONS)
+
+        def _candidate_paths(file_stem, rel_stem):
+            if dual_mode and self.mask_root:
+                base_rel = rel_stem.replace("\\", "/")
+                return [
+                    os.path.join(self.mask_root, base_rel + ext) for ext in exact_exts
+                ] + [
+                    os.path.join(self.mask_root, base_rel + "_mask" + ext)
+                    for ext in exact_exts
+                ]
+            return [
+                os.path.join(src_dir, file_stem + ext) for ext in exact_exts
+            ] + [
+                os.path.join(src_dir, file_stem + "_mask" + ext)
+                for ext in exact_exts
+            ]
+
+        unmatched = []
+        for filename in source_filenames:
+            full_src = os.path.join(src_dir, filename)
+            rel_src = os.path.join(rel_dir, filename).replace("\\", "/") if rel_dir else filename
+            file_stem = self._strip_compound_ext(filename)
+            rel_stem = self._strip_compound_ext(rel_src)
+            chosen = ""
+            seen = set()
+            for candidate in _candidate_paths(file_stem, rel_stem):
+                if not candidate:
+                    continue
+                norm_candidate = os.path.normpath(candidate)
+                if norm_candidate in seen:
+                    continue
+                seen.add(norm_candidate)
+                if norm_candidate == os.path.normpath(full_src):
+                    continue
+                if os.path.exists(candidate):
+                    chosen = candidate
+                    used_masks.add(norm_candidate)
+                    break
+            if chosen:
+                mapping[os.path.normpath(full_src)] = chosen
+            else:
+                unmatched.append((filename, full_src))
+
+        generic_masks = []
+        if os.path.isdir(mask_dir):
+            try:
+                for mask_name in os.listdir(mask_dir):
+                    mask_path = os.path.join(mask_dir, mask_name)
+                    if not os.path.isfile(mask_path):
+                        continue
+                    lower = mask_name.lower()
+                    if not lower.endswith(MASK_FILE_EXTENSIONS):
+                        continue
+                    norm_mask = os.path.normpath(mask_path)
+                    if norm_mask in used_masks:
+                        continue
+                    if self._is_generic_xray_mask_name(mask_name):
+                        generic_masks.append(mask_path)
+            except OSError:
+                generic_masks = []
+
+        generic_masks.sort(key=lambda p: natural_sort_key(os.path.basename(p)))
+        unmatched.sort(key=lambda item: natural_sort_key(item[0]))
+
+        if generic_masks and unmatched:
+            can_pair = len(generic_masks) == len(unmatched) or (
+                len(generic_masks) == 1 and len(unmatched) == 1
+            )
+            if can_pair:
+                for (_, full_src), mask_path in zip(unmatched, generic_masks):
+                    mapping[os.path.normpath(full_src)] = mask_path
+
+        cache[cache_key] = dict(mapping)
+        return dict(mapping)
 
     def _resolve_xray_mask_path(self, orig_path, rel_src=None):
         if not orig_path:
@@ -224,54 +397,10 @@ class DataMixin:
         rel_src = (rel_src or os.path.relpath(orig_path, self.orig_root)).replace(
             "\\", "/"
         )
-        rel_stem = self._strip_compound_ext(rel_src)
-        filename = os.path.basename(orig_path)
-        file_stem = self._strip_compound_ext(filename)
-        dual_mode = is_dual_folder_mode(self.orig_root, self.mask_root)
-
-        candidates = []
-        if dual_mode and self.mask_root:
-            rel_dir = os.path.dirname(rel_src)
-            candidates.extend(
-                [
-                    os.path.join(self.mask_root, rel_src),
-                    os.path.join(self.mask_root, rel_src + ".png"),
-                    os.path.join(self.mask_root, rel_stem + ".png"),
-                    os.path.join(self.mask_root, rel_stem + ".nii.gz"),
-                    os.path.join(self.mask_root, rel_stem + ".nii"),
-                    os.path.join(self.mask_root, rel_stem + "_mask.png"),
-                    os.path.join(self.mask_root, rel_stem + "_mask.nii.gz"),
-                    os.path.join(self.mask_root, rel_stem + "_mask.nii"),
-                    os.path.join(self.mask_root, rel_dir, "Untitled.nii.gz"),
-                    os.path.join(self.mask_root, rel_dir, "Untitled.nii"),
-                    os.path.join(self.mask_root, rel_dir, "Untitled.png"),
-                ]
-            )
-        else:
-            base_dir = os.path.dirname(orig_path)
-            candidates.extend(
-                [
-                    orig_path + ".png",
-                    os.path.join(base_dir, file_stem + ".png"),
-                    os.path.join(base_dir, file_stem + ".nii.gz"),
-                    os.path.join(base_dir, file_stem + ".nii"),
-                    os.path.join(base_dir, file_stem + "_mask.png"),
-                    os.path.join(base_dir, file_stem + "_mask.nii.gz"),
-                    os.path.join(base_dir, file_stem + "_mask.nii"),
-                    os.path.join(base_dir, "Untitled.nii.gz"),
-                    os.path.join(base_dir, "Untitled.nii"),
-                    os.path.join(base_dir, "Untitled.png"),
-                ]
-            )
-
-        seen = set()
-        for candidate in candidates:
-            if not candidate or candidate in seen:
-                continue
-            seen.add(candidate)
-            if os.path.exists(candidate) and os.path.normpath(candidate) != os.path.normpath(orig_path):
-                return candidate
-        return ""
+        src_dir = os.path.dirname(orig_path)
+        rel_dir = os.path.dirname(rel_src)
+        mapping = self._build_xray_dir_mask_map(src_dir, rel_dir)
+        return mapping.get(os.path.normpath(orig_path), "")
 
     def _resolve_ct_mask_path(self, orig_path, p_mask, rel_in_case):
         """CT 序列模式下搜索已有掩码（支持 NIfTI），找不到则回退为默认 PNG 路径。
@@ -285,17 +414,12 @@ class DataMixin:
         """
         stem = os.path.splitext(rel_in_case)[0]
         # NIfTI 的复合扩展名需特殊处理
-        if rel_in_case.lower().endswith(".nii.gz"):
-            stem = rel_in_case[:-7]
+        if rel_in_case.lower().endswith(DEFAULT_NIFTI_EXT):
+            stem = rel_in_case[: -len(DEFAULT_NIFTI_EXT)]
 
         # 搜索顺序：先查已有文件，NIfTI 和 PNG 都查
         candidates = [
-            os.path.join(p_mask, stem + ".nii.gz"),
-            os.path.join(p_mask, stem + ".nii"),
-            os.path.join(p_mask, stem + "_mask.nii.gz"),
-            os.path.join(p_mask, stem + "_mask.nii"),
-            os.path.join(p_mask, stem + ".png"),
-            os.path.join(p_mask, stem + "_mask.png"),
+            os.path.join(p_mask, stem + suffix) for suffix in CT_MASK_CANDIDATE_SUFFIXES
         ]
         seen = set()
         for candidate in candidates:
@@ -307,7 +431,7 @@ class DataMixin:
                 return candidate
 
         # 回退：默认 PNG 路径
-        return os.path.join(p_mask, stem + ".png")
+        return default_mask_path(p_mask, stem, DEFAULT_MASK_BITMAP_EXT)
 
     def _build_prefetch_indices(self, current_idx):
         total = len(self.entries)
@@ -457,92 +581,107 @@ class DataMixin:
             entries.extend(self._expand_case_to_entries(next_case))
         return entries
 
-    def _expand_case_to_entries(self, case_name):
-        """把一个病例名展开成 ImageEntry 列表。
+    def _build_default_xray_mask_path(self, orig_path):
+        stem = self._strip_compound_ext(os.path.basename(orig_path))
+        mask_dir = self.mask_root or os.path.dirname(orig_path)
+        return default_mask_path(mask_dir, stem, DEFAULT_MASK_BITMAP_EXT)
 
-        修复：
-        - 文件型病例（X光）：返回单元素列表。
-        - 目录型病例（CT序列）：枚举目录内所有切片，与 load_case_sequence 规则一致。
-        - 找不到路径时返回空列表，不再 return None 导致调用方崩溃。
-        """
-        if not case_name:
-            return []
-        case_path = os.path.join(self.orig_root, case_name)
-        dual_mode = is_dual_folder_mode(self.orig_root, self.mask_root)
+    def _build_xray_entry(self, full_src, case_name, filename=None, rel_src=None, has_pneumo=None):
+        filename = filename or os.path.basename(full_src)
+        rel_src = (rel_src or os.path.relpath(full_src, self.orig_root)).replace("\\", "/")
+        if has_pneumo is None:
+            has_pneumo = self._labels_cache.get(rel_src, 0)
 
-        # ── 文件型（X光单张或任务模式单文件）──────────────────────────────────
-        if os.path.isfile(case_path):
-            rel_src = case_name.replace("\\", "/")
-            mask_path = self._resolve_xray_mask_path(case_path, rel_src=rel_src)
-            # [修复] 未找到已有掩码时，生成默认保存路径
-            if not mask_path:
-                _stem = self._strip_compound_ext(os.path.basename(case_path))
-                _mask_dir = self.mask_root or os.path.dirname(case_path)
-                mask_path = os.path.join(_mask_dir, f"{_stem}_mask.png")
+        mask_path = self._resolve_xray_mask_path(full_src, rel_src=rel_src)
+        if not mask_path:
+            mask_path = self._build_default_xray_mask_path(full_src)
+
+        return ImageEntry(
+            case_name=case_name,
+            orig_path=full_src,
+            mask_path=mask_path,
+            filename=filename,
+            has_mask=os.path.exists(mask_path),
+            has_pneumothorax=has_pneumo,
+        )
+
+    def _build_xray_case_entries(self, case_name):
+        case_file_path = os.path.join(self.orig_root, case_name)
+        if os.path.isfile(case_file_path):
             return [
-                ImageEntry(
+                self._build_xray_entry(
+                    case_file_path,
                     case_name=case_name,
-                    orig_path=case_path,
-                    mask_path=mask_path,
-                    filename=os.path.basename(case_path),
-                    has_mask=os.path.exists(mask_path),
-                    has_pneumothorax=0,
+                    filename=os.path.basename(case_file_path),
+                    rel_src=case_name.replace("\\", "/"),
                 )
             ]
 
-        # ── 目录型（CT序列）────────────────────────────────────────────────────
-        if os.path.isdir(case_path):
-            IGNORED_EXTS = {".py", ".json", ".txt", ".md", ".exe", ".dll", ".bat"}
-            entries = []
-            try:
-                fnames = os.listdir(case_path)
-            except OSError:
-                return []
+        if not os.path.isdir(case_file_path):
+            return []
 
-            # 与 load_case_sequence 保持一致：跳过明显的侧车掩码，避免把掩码当原图
-            base_names = set()
-            for f in fnames:
-                ext = os.path.splitext(f)[1].lower()
-                if (
-                    ext not in IGNORED_EXTS
-                    and ext != ".png"
-                    and not self._is_xray_mask_sidecar(f)
-                ):
-                    base_names.add(os.path.splitext(f)[0])
-
-            for f in sorted(fnames, key=natural_sort_key):
-                ext = os.path.splitext(f)[1].lower()
-                if ext in IGNORED_EXTS or self._is_xray_mask_sidecar(f):
-                    continue
-                if ext == ".png" and os.path.splitext(f)[0] in base_names:
-                    continue
-                full_src = os.path.join(case_path, f)
-                if os.path.isdir(full_src):
-                    continue
-
-                file_rel_src = os.path.relpath(full_src, self.orig_root).replace(
-                    "\\", "/"
+        files = []
+        for filename in self._iter_xray_source_filenames(case_file_path):
+            full_src = os.path.join(case_file_path, filename)
+            rel_src = os.path.relpath(full_src, self.orig_root).replace("\\", "/")
+            files.append(
+                self._build_xray_entry(
+                    full_src,
+                    case_name=case_name,
+                    filename=filename,
+                    rel_src=rel_src,
                 )
-                mask_path = self._resolve_xray_mask_path(full_src, rel_src=file_rel_src)
-                # [修复] 未找到已有掩码时，生成默认保存路径
-                if not mask_path:
-                    _stem = self._strip_compound_ext(f)
-                    _mask_dir = self.mask_root or os.path.dirname(full_src)
-                    mask_path = os.path.join(_mask_dir, f"{_stem}_mask.png")
+            )
+        files.sort(key=lambda x: natural_sort_key(x.filename))
+        return files
 
-                entries.append(
+    def _build_ct_case_entries(self, case_name):
+        p_orig = (
+            os.path.join(self.orig_root, case_name)
+            if case_name != "Root"
+            else self.orig_root
+        )
+        p_mask = os.path.join(self.mask_root, case_name) if self.mask_root else p_orig
+
+        files = []
+        exts = set(CT_SOURCE_EXTENSIONS)
+        for root, _, filenames in os.walk(p_orig):
+            for filename in filenames:
+                if os.path.splitext(filename)[1].lower() not in exts:
+                    continue
+                full_src = os.path.join(root, filename)
+                rel_in_case = os.path.relpath(full_src, p_orig)
+                rel_src = os.path.relpath(full_src, self.orig_root).replace("\\", "/")
+                mask_path = self._resolve_ct_mask_path(full_src, p_mask, rel_in_case)
+                files.append(
                     ImageEntry(
                         case_name=case_name,
                         orig_path=full_src,
                         mask_path=mask_path,
-                        filename=f,
+                        filename=rel_in_case,
                         has_mask=os.path.exists(mask_path),
-                        has_pneumothorax=0,
+                        has_pneumothorax=self._labels_cache.get(rel_src, 0),
                     )
                 )
-            return entries
+        files.sort(key=lambda x: natural_sort_key(x.filename))
+        return files
 
-        return []
+    def _build_case_entries(self, case_name):
+        if self.task_mode:
+            files = list(self.task_case_entries.get(case_name, []))
+            files.sort(key=lambda x: natural_sort_key(x.filename))
+            return files
+        if self.scan_mode == ScanMode.CT_SEQUENCE:
+            return self._build_ct_case_entries(case_name)
+        return self._build_xray_case_entries(case_name)
+
+    def _expand_case_to_entries(self, case_name):
+        """把一个病例名展开成 ImageEntry 列表。"""
+        if not case_name:
+            return []
+        if self.scan_mode == ScanMode.CT_SEQUENCE:
+            return self._build_ct_case_entries(case_name)
+        return self._build_xray_case_entries(case_name)
 
     def _prefetch_case_worker(self, epoch, token, entries):
         for entry in entries:
@@ -617,6 +756,8 @@ class DataMixin:
 
     def load_task_json(self, json_path: str):
         self._flush_labels_cache()
+        if hasattr(self, "_xray_dir_match_cache"):
+            self._xray_dir_match_cache.clear()
         data = None
         for enc in ("utf-8-sig", "utf-8", "gbk"):
             try:
@@ -686,11 +827,8 @@ class DataMixin:
             else:
                 case_name = rel_norm
                 mask_path = self._resolve_xray_mask_path(full_src, rel_src=rel_norm)
-                # [修复] 未找到已有掩码时，生成默认保存路径
                 if not mask_path:
-                    _stem = self._strip_compound_ext(os.path.basename(full_src))
-                    _mask_dir = self.mask_root or os.path.dirname(full_src)
-                    mask_path = os.path.join(_mask_dir, f"{_stem}_mask.png")
+                    mask_path = self._build_default_xray_mask_path(full_src)
                 filename = os.path.basename(full_src)
 
             has_mask = os.path.exists(mask_path)
@@ -809,29 +947,8 @@ class DataMixin:
                     found_cases.append((case_name, is_completed, has_pneumo))
 
             else:
-                IGNORED_EXTS = {".py", ".json", ".txt", ".md", ".exe", ".dll", ".bat"}
-
-                for root_dir, _, files in os.walk(orig_root):
-                    base_names = set()
-
-                    for f in files:
-                        ext = os.path.splitext(f)[1].lower()
-                        if (
-                            ext not in IGNORED_EXTS
-                            and ext != ".png"
-                            and not self._is_xray_mask_sidecar(f)
-                        ):
-                            base_names.add(os.path.splitext(f)[0])
-
-                    for f in files:
-                        ext = os.path.splitext(f)[1].lower()
-
-                        if ext in IGNORED_EXTS or self._is_xray_mask_sidecar(f):
-                            continue
-
-                        if ext == ".png" and f[:-4] in base_names:
-                            continue
-
+                for root_dir, _, _ in os.walk(orig_root):
+                    for f in self._iter_xray_source_filenames(root_dir):
                         full_path = os.path.join(root_dir, f)
 
                         case_name = os.path.relpath(full_path, orig_root).replace(
@@ -907,6 +1024,8 @@ class DataMixin:
     def refresh_lists(self):
         """完全解耦的目录扫描，根据UI选项智能处理"""
         self.single_pair_mode = False
+        if hasattr(self, "_xray_dir_match_cache"):
+            self._xray_dir_match_cache.clear()
 
         if not self.orig_root:
             return
@@ -962,6 +1081,27 @@ class DataMixin:
         self._scan_timer.timeout.connect(lambda: self._poll_scan_result(token))
         self._scan_timer.start()
 
+    def _start_case_background_work(self, case_name, thumb_token=None):
+        if case_name != getattr(self, "current_case_name", None):
+            return
+        if self.current_idx < 0 or self.current_idx >= len(self.entries):
+            return
+
+        if self.scan_mode == ScanMode.CT_SEQUENCE:
+            if thumb_token is not None and hasattr(self, "_thumb_drain_timer"):
+                self._thumb_drain_timer.start()
+                t = threading.Thread(
+                    target=self._thumb_worker,
+                    args=(list(self.entries), thumb_token),
+                    daemon=True,
+                )
+                t.start()
+            self._start_prefetch(self.current_idx)
+            if self.current_idx == 0:
+                self._start_cross_case_prefetch()
+        else:
+            self._start_cross_case_prefetch()
+
     def load_case_sequence(self, item):
         # [修复] 切换病例时立即推进预取 epoch，终止旧病例后台预取；同一病例内的不同预取类型互不取消。
         self._next_prefetch_epoch()
@@ -982,165 +1122,29 @@ class DataMixin:
         if hasattr(self, "info_panel") and hasattr(self.info_panel, "table"):
             self.info_panel.table.setRowCount(0)
 
-        files = []
-
-        if self.task_mode:
-            files = list(self.task_case_entries.get(case_name, []))
-            files.sort(key=lambda x: natural_sort_key(x.filename))
-        else:
-            if self.scan_mode == ScanMode.CT_SEQUENCE:
-                p_orig = (
-                    os.path.join(self.orig_root, case_name)
-                    if case_name != "Root"
-                    else self.orig_root
-                )
-
-                p_mask = (
-                    os.path.join(self.mask_root, case_name)
-                    if self.mask_root
-                    else p_orig
-                )
-
-                exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".dcm"}
-
-                for root, _, fs in os.walk(p_orig):
-                    for f in fs:
-                        if os.path.splitext(f)[1].lower() in exts:
-                            full = os.path.join(root, f)
-                            rel = os.path.relpath(full, p_orig)
-
-                            # [修复] 搜索已有掩码（含 NIfTI），而非硬编码 .png
-                            mask_full = self._resolve_ct_mask_path(full, p_mask, rel)
-
-                            rel_src = os.path.relpath(full, self.orig_root).replace(
-                                "\\", "/"
-                            )
-                            has_pneumo = self._labels_cache.get(rel_src, 0)
-
-                            files.append(
-                                ImageEntry(
-                                    case_name=case_name,
-                                    orig_path=full,
-                                    mask_path=mask_full,
-                                    filename=rel,
-                                    has_mask=os.path.exists(mask_full),
-                                    has_pneumothorax=has_pneumo,
-                                )
-                            )
-                files.sort(key=lambda x: natural_sort_key(x.filename))
-            else:
-                case_file_path = os.path.join(self.orig_root, case_name)
-                rel_src = case_name.replace("\\", "/")
-                has_pneumo = self._labels_cache.get(rel_src, 0)
-
-                if os.path.isfile(case_file_path):
-                    filename = os.path.basename(case_file_path)
-                    mask_path = self._resolve_xray_mask_path(
-                        case_file_path, rel_src=rel_src
-                    )
-                    # [修复] 未找到已有掩码时，生成默认保存路径，避免 save_mask() 报"未分配掩码路径"
-                    if not mask_path:
-                        _stem = self._strip_compound_ext(filename)
-                        _mask_dir = self.mask_root or os.path.dirname(case_file_path)
-                        mask_path = os.path.join(_mask_dir, f"{_stem}_mask.png")
-
-                    files.append(
-                        ImageEntry(
-                            case_name=case_name,
-                            orig_path=case_file_path,
-                            mask_path=mask_path,
-                            filename=filename,
-                            has_mask=os.path.exists(mask_path),
-                            has_pneumothorax=has_pneumo,
-                        )
-                    )
-                elif os.path.isdir(case_file_path):
-                    p_orig = case_file_path
-                    IGNORED_EXTS = {
-                        ".py",
-                        ".json",
-                        ".txt",
-                        ".md",
-                        ".exe",
-                        ".dll",
-                        ".bat",
-                    }
-
-                    base_names = set()
-                    for f in os.listdir(p_orig):
-                        ext = os.path.splitext(f)[1].lower()
-                        if (
-                            ext not in IGNORED_EXTS
-                            and ext != ".png"
-                            and not self._is_xray_mask_sidecar(f)
-                        ):
-                            base_names.add(os.path.splitext(f)[0])
-
-                    for f in os.listdir(p_orig):
-                        ext = os.path.splitext(f)[1].lower()
-
-                        if ext in IGNORED_EXTS or self._is_xray_mask_sidecar(f):
-                            continue
-
-                        if ext == ".png" and f[:-4] in base_names:
-                            continue
-
-                        full_src = os.path.join(p_orig, f)
-
-                        if os.path.isdir(full_src):
-                            continue
-
-                        file_rel_src = os.path.relpath(
-                            full_src, self.orig_root
-                        ).replace("\\", "/")
-                        file_has_pneumo = self._labels_cache.get(file_rel_src, 0)
-
-                        mask_path = self._resolve_xray_mask_path(
-                            full_src, rel_src=file_rel_src
-                        )
-                        # [修复] 未找到已有掩码时，生成默认保存路径
-                        if not mask_path:
-                            _stem = self._strip_compound_ext(f)
-                            _mask_dir = self.mask_root or os.path.dirname(full_src)
-                            mask_path = os.path.join(_mask_dir, f"{_stem}_mask.png")
-
-                        files.append(
-                            ImageEntry(
-                                case_name=case_name,
-                                orig_path=full_src,
-                                mask_path=mask_path,
-                                filename=f,
-                                has_mask=os.path.exists(mask_path),
-                                has_pneumothorax=file_has_pneumo,
-                            )
-                        )
-
+        files = self._build_case_entries(case_name)
         self.entries = files
 
-        if self.scan_mode == ScanMode.XRAY_SINGLE and len(files) <= 1:
-            self._reset_cache(clear_cache=False, invalidate_prefetch=False)
-        else:
-            self._reset_cache(clear_cache=True, invalidate_prefetch=False)
+        # 性能优化：切病例时保留现有缓存，只推进 epoch 终止旧预取；
+        # 这样首帧命中缓存时不会被强制重新读盘。
+        self._reset_cache(clear_cache=False, invalidate_prefetch=False)
 
         self.statusBar().showMessage(f"加载序列: {case_name} ({len(files)} 张)")
-        QApplication.processEvents()
 
         is_ct = self.scan_mode == ScanMode.CT_SEQUENCE
+        thumb_token = None
 
-        # CT 模式：先插入占位符立即显示，缩略图由后台线程异步生成
+        # CT 模式：先插入占位符，首帧显示后再启动缩略图与预取，避免首屏与后台 IO 抢盘。
         if is_ct:
-            # ── 取消上一次未完成的缩略图任务 ────────────────────────────────
             self._thumb_token = getattr(self, "_thumb_token", 0) + 1
-            current_token = self._thumb_token
+            thumb_token = self._thumb_token
 
-            # ── 初始化异步基础设施（只做一次）───────────────────────────────
             if not hasattr(self, "_thumb_queue"):
                 self._thumb_queue = queue.Queue()
                 self._thumb_drain_timer = QTimer(self)
                 self._thumb_drain_timer.setInterval(40)
                 self._thumb_drain_timer.timeout.connect(self._drain_thumb_queue)
 
-            # ── 插入占位符（灰色方块），立即可见 ─────────────────────────────
             placeholder_pix = QPixmap(80, 80)
             placeholder_pix.fill(QColor("#252535"))
             placeholder_icon = QIcon(placeholder_pix)
@@ -1157,76 +1161,71 @@ class DataMixin:
                 self.seek_slider.setEnabled(True)
             else:
                 self.seek_slider.setEnabled(False)
-
-            # ── 启动后台线程生成真实缩略图 ────────────────────────────────────
-            self._thumb_drain_timer.start()
-            t = threading.Thread(
-                target=self._thumb_worker,
-                args=(list(files), current_token),
-                daemon=True,
-            )
-            t.start()
         else:
-            # X 光模式：不生成缩略图，禁用序列导航
             self.seek_slider.setEnabled(False)
 
         if self.entries:
-            self.load_image_at_index(0)
-
-    # ══════════════════════════════════════════════════════════════════════
-    # 缩略图异步生成
-    # ══════════════════════════════════════════════════════════════════════
+            self.load_image_at_index(0, start_background=False)
+            QTimer.singleShot(
+                0,
+                lambda cn=case_name, tt=thumb_token: self._start_case_background_work(cn, tt),
+            )
 
     def _thumb_worker(self, entries, token):
         """后台线程：逐张生成缩略图并放入队列，由主线程消费。"""
         for i, entry in enumerate(entries):
-            # 取消检测：如果 token 已经过期，立即退出
             if getattr(self, "_thumb_token", 0) != token:
                 return
 
             icon = self._build_thumb_icon(entry)
             self._thumb_queue.put((token, i, icon))
 
-        # 哨兵：告诉 drain 本批次完成
         self._thumb_queue.put((token, None, None))
 
-    @staticmethod
-    def _build_thumb_icon(entry) -> QIcon:
-        """纯计算，不触碰任何 Qt 控件，可在子线程安全调用。"""
-        img_thumb = smart_read_image(entry.orig_path)
-        if img_thumb is None:
-            return QIcon()
+    def _build_thumb_icon(self, entry) -> QIcon:
+        """优先复用缓存，降低缩略图线程对磁盘的重复读取。"""
+        cached = None
+        with self._cache_lock:
+            cached = self._image_cache.get(entry.orig_path)
+
+        img_thumb = None
+        mask_img = None
+        if cached:
+            img_thumb = cached[0]
+            if entry.has_mask and len(cached) >= 2:
+                mask_img = cached[1]
+        else:
+            img_thumb = smart_read_image(entry.orig_path)
+            if img_thumb is None:
+                return QIcon()
+            if entry.has_mask and os.path.exists(entry.mask_path):
+                mask_img, _ = read_mask_file(
+                    entry.mask_path,
+                    target_shape=(80, 80),
+                    reference_image_path=entry.orig_path,
+                )
 
         img_thumb = cv2.resize(img_thumb, (80, 80), interpolation=cv2.INTER_AREA)
         if len(img_thumb.shape) == 2:
             img_thumb = cv2.cvtColor(img_thumb, cv2.COLOR_GRAY2RGB)
 
-        if entry.has_mask:
-            mask_img, _ = read_mask_file(
-                entry.mask_path,
-                target_shape=(80, 80),
-                reference_image_path=entry.orig_path,
-            )            
-            if mask_img is not None:
-                mask_thumb = cv2.resize(
-                    mask_img, (80, 80), interpolation=cv2.INTER_NEAREST
-                )
-                bin_mask = (mask_thumb >= 127).astype(np.uint8)
-                overlay = np.zeros_like(img_thumb)
-                overlay[..., 0] = 255
-                overlay[..., 1] = 50
-                overlay[..., 2] = 50
-                alpha = 0.5
-                mask3 = bin_mask[..., None].astype(np.float32)
-                img_thumb = (
-                    img_thumb.astype(np.float32) * (1.0 - alpha * mask3)
-                    + overlay.astype(np.float32) * (alpha * mask3)
-                ).astype(np.uint8)
+        if mask_img is not None:
+            mask_thumb = cv2.resize(mask_img, (80, 80), interpolation=cv2.INTER_NEAREST)
+            bin_mask = (mask_thumb >= 127).astype(np.uint8)
+            overlay = np.zeros_like(img_thumb)
+            overlay[..., 0] = 255
+            overlay[..., 1] = 50
+            overlay[..., 2] = 50
+            alpha = 0.5
+            mask3 = bin_mask[..., None].astype(np.float32)
+            img_thumb = (
+                img_thumb.astype(np.float32) * (1.0 - alpha * mask3)
+                + overlay.astype(np.float32) * (alpha * mask3)
+            ).astype(np.uint8)
 
         qimg = QImage(
             img_thumb.data, 80, 80, img_thumb.strides[0], QImage.Format_RGB888
         )
-        # QImage 引用了 numpy buffer，必须在转 QPixmap 前复制
         pix = QPixmap.fromImage(qimg.copy())
 
         if entry.has_mask:
@@ -1263,7 +1262,7 @@ class DataMixin:
                 item.setIcon(icon)
             processed += 1
 
-    def load_image_at_index(self, idx):
+    def load_image_at_index(self, idx, start_background=True):
         if idx < 0 or idx >= len(self.entries):
             return
 
@@ -1350,15 +1349,13 @@ class DataMixin:
 
         self._update_status_ui()
 
-        if self.scan_mode == ScanMode.CT_SEQUENCE:
-            # 序列内帧预取
-            self._start_prefetch(idx)
-            # 当前帧是序列首帧时，同时触发跨病号预取（提前缓存下一个病号）
-            if idx == 0:
+        if start_background:
+            if self.scan_mode == ScanMode.CT_SEQUENCE:
+                self._start_prefetch(idx)
+                if idx == 0:
+                    self._start_cross_case_prefetch()
+            else:
                 self._start_cross_case_prefetch()
-        else:
-            # X光单张：直接跨病例预取
-            self._start_cross_case_prefetch()
 
     def on_slider_change(self, value):
         if value != self.current_idx:
