@@ -372,27 +372,99 @@ def natural_sort_key(s: str):
     ]
 
 
+
+
+_THEME_PALETTES = {
+    "dark": {
+        "bg": "#1e1e2e",
+        "panel": "#252535",
+        "text": "#e0e0e0",
+        "accent": "#00f0ff",
+        "border": "#3e3e4e",
+        "status_warning": "#ffaa00",
+        "status_error": "#ff5555",
+    },
+    "light": {
+        "bg": "#f0f2f5",
+        "panel": "#ffffff",
+        "text": "#333333",
+        "accent": "#0078d7",
+        "border": "#d1d5db",
+        "status_warning": "#f59e0b",
+        "status_error": "#d32f2f",
+    },
+}
+_CURRENT_THEME = "dark"
+
+
+def set_current_theme(name: str):
+    """????????????????"""
+    global _CURRENT_THEME
+    if name in _THEME_PALETTES:
+        _CURRENT_THEME = name
+
+
+def get_theme_palette(name: str | None = None) -> dict:
+    return _THEME_PALETTES.get(name or _CURRENT_THEME, _THEME_PALETTES["dark"])
+
+
+def get_theme_color(key: str, fallback: str | None = None, theme_name: str | None = None):
+    """?????????????????? fallback?"""
+    palette = get_theme_palette(theme_name)
+    return palette.get(key, fallback)
+
+
+def detect_system_theme(app: QApplication | None = None) -> str:
+    """根据应用当前调色板粗略判断系统/样式偏好，返回 dark 或 light。"""
+    app = app or QApplication.instance()
+    if app is None:
+        return _CURRENT_THEME
+
+    try:
+        win_color = app.palette().window().color()
+        text_color = app.palette().windowText().color()
+        # 以窗口背景明度为主，文字颜色作辅助判断
+        if win_color.lightness() <= 128 or text_color.lightness() >= 160:
+            return "dark"
+        return "light"
+    except Exception:
+        return _CURRENT_THEME
+
+
+def apply_auto_theme(app: QApplication | None = None) -> str:
+    """跟随当前系统/样式调色板自动应用深浅主题。"""
+    app = app or QApplication.instance()
+    theme_name = detect_system_theme(app)
+    if theme_name == "light":
+        apply_light_theme(app)
+    else:
+        apply_tech_theme(app)
+    return theme_name
 def apply_tech_theme(app: QApplication):
-    """深色科技主题"""
-    bg_color = "#1e1e2e"
-    panel_color = "#252535"
-    text_color = "#e0e0e0"
-    accent_color = "#00f0ff"
-    border_color = "#3e3e4e"
-
-    _apply_theme_qss(app, bg_color, panel_color, text_color, accent_color, border_color)
-
+    """??????"""
+    set_current_theme("dark")
+    palette = get_theme_palette("dark")
+    _apply_theme_qss(
+        app,
+        palette["bg"],
+        palette["panel"],
+        palette["text"],
+        palette["accent"],
+        palette["border"],
+    )
 
 def apply_light_theme(app: QApplication):
-    """浅色护眼主题"""
-    bg_color = "#f0f2f5"
-    panel_color = "#ffffff"
-    text_color = "#333333"  # 深色文字
-    accent_color = "#0078d7"  # 科技蓝
-    border_color = "#d1d5db"
-
-    _apply_theme_qss(app, bg_color, panel_color, text_color, accent_color, border_color)
-
+    """??????"""
+    set_current_theme("light")
+    palette = get_theme_palette("light")
+    _apply_theme_qss(
+        app,
+        palette["bg"],
+        palette["panel"],
+        palette["text"],
+        palette["accent"],
+        palette["border"],
+    )
 
 def _apply_theme_qss(
     app: QApplication, bg_color, panel_color, text_color, accent_color, border_color
@@ -409,6 +481,24 @@ def _apply_theme_qss(
     style_sheet = f"""
     QMainWindow {{ background-color: {bg_color}; }}
     QWidget {{ color: {text_color}; font-family: "Microsoft YaHei UI", "Segoe UI", "SimHei"; font-size: 10pt; }}
+    QDialog, QMessageBox {{ background-color: {bg_color}; color: {text_color}; }}
+    QStatusBar {{ background-color: {panel_color}; color: {text_color}; border-top: 1px solid {border_color}; }}
+    QStatusBar::item {{ border: none; }}
+    QPushButton {{
+        background-color: {panel_color};
+        color: {text_color};
+        border: 1px solid {border_color};
+        border-radius: 4px;
+        padding: 5px 12px;
+    }}
+    QPushButton:hover {{ border: 1px solid {accent_color}; background-color: {hover_color}; }}
+    QPushButton:pressed {{ background-color: {checked_color}; }}
+    QLineEdit, QTextEdit, QPlainTextEdit, QListView, QTreeView {{
+        background-color: {panel_color};
+        color: {text_color};
+        border: 1px solid {border_color};
+        border-radius: 4px;
+    }}
 
     /* --- 新增：菜单栏与下拉菜单的颜色适配 --- */
     QMenuBar {{ background-color: {panel_color}; color: {text_color}; }}

@@ -211,6 +211,7 @@ class PrefetchSettingsDialog(QDialog):
         ct_cache_max=40,
         xray_prefetch_count=5,
         xray_cache_max=12,
+        xray_default_mask_format="png",
     ):
         super().__init__(parent)
         self.setWindowTitle("性能设置")
@@ -287,8 +288,20 @@ class PrefetchSettingsDialog(QDialog):
         )
         form_cache_xray.addRow("缓存上限", self.spin_xray_cache)
 
+        grp_mask_fmt = QGroupBox("项目默认掩码格式")
+        form_mask_fmt = QFormLayout(grp_mask_fmt)
+        self.combo_xray_mask_format = QComboBox()
+        self.combo_xray_mask_format.addItem("PNG（位图掩码）", "png")
+        self.combo_xray_mask_format.addItem("NIfTI（.nii.gz）", "nii")
+        fmt_value = str(xray_default_mask_format or "png").strip().lower()
+        idx = 1 if fmt_value in ("nii", "nii.gz", "nifti") else 0
+        self.combo_xray_mask_format.setCurrentIndex(idx)
+        self.combo_xray_mask_format.setToolTip("X 光模式下新建掩码、尚未存在掩码文件时默认使用的保存格式。")
+        form_mask_fmt.addRow("新建掩码默认格式", self.combo_xray_mask_format)
+
         xray_layout.addWidget(grp_xray_pre)
         xray_layout.addWidget(grp_cache_xray)
+        xray_layout.addWidget(grp_mask_fmt)
         xray_layout.addStretch()
         tabs.addTab(xray_widget, "X 光单张")
 
@@ -306,6 +319,7 @@ class PrefetchSettingsDialog(QDialog):
             "ct_cache_max": self.spin_ct_cache.value(),
             "xray_prefetch_count": self.spin_xray_prefetch.value(),
             "xray_cache_max": self.spin_xray_cache.value(),
+            "xray_default_mask_format": self.combo_xray_mask_format.currentData(),
         }
 
 
@@ -332,15 +346,18 @@ class ExportSettingsDialog(QDialog):
         form.addRow("质量", self.spin_quality)
 
         self.combo_format = QComboBox()
-        self.combo_format.addItems(["png", "jpg","nii"])
+        self.combo_format.addItems(["png", "jpg", "nii"])
         form.addRow("格式", self.combo_format)
+
         self.check_invert = QCheckBox("反色导出")
         form.addRow("显示模式", self.check_invert)
 
         self.edit_path = QLineEdit()
         self.edit_path.setText(default_path)
+
         btn_browse = QPushButton("浏览")
         btn_browse.clicked.connect(self._browse_path)
+
         path_row = QHBoxLayout()
         path_row.addWidget(self.edit_path)
         path_row.addWidget(btn_browse)
@@ -349,9 +366,60 @@ class ExportSettingsDialog(QDialog):
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._accept_with_normalized_path)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+        self.combo_format.currentTextChanged.connect(self._on_format_changed)
+
+        self._normalize_initial_format(default_path)
+
+    def _split_known_ext(self, path: str):
+        path = path or ""
+        lower = path.lower()
+        for ext in (".nii.gz", ".nii", ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"):
+            if lower.endswith(ext):
+                return path[: -len(ext)], ext
+        return path, ""
+
+    def _ensure_path_ext(self, path: str, fmt: str) -> str:
+        stem, _ = self._split_known_ext(path)
+        fmt = (fmt or "png").lower()
+        if fmt == "jpg":
+            return stem + ".jpg"
+        if fmt == "nii":
+            return stem + ".nii.gz"
+        return stem + ".png"
+
+    def _filter_for_format(self, fmt: str) -> str:
+        fmt = (fmt or "png").lower()
+        if fmt == "jpg":
+            return "JPG Files (*.jpg *.jpeg);;PNG Files (*.png);;NIfTI Files (*.nii.gz *.nii);;All Files (*)"
+        if fmt == "nii":
+            return "NIfTI Files (*.nii.gz *.nii);;PNG Files (*.png);;JPG Files (*.jpg *.jpeg);;All Files (*)"
+        return "PNG Files (*.png);;JPG Files (*.jpg *.jpeg);;NIfTI Files (*.nii.gz *.nii);;All Files (*)"
+
+    def _normalize_initial_format(self, default_path: str):
+        lower = (default_path or "").lower()
+        if lower.endswith((".nii.gz", ".nii")):
+            self.combo_format.setCurrentText("nii")
+        elif lower.endswith((".jpg", ".jpeg")):
+            self.combo_format.setCurrentText("jpg")
+        else:
+            self.combo_format.setCurrentText("png")
+        self.edit_path.setText(self._ensure_path_ext(default_path or "export.png", self.combo_format.currentText()))
+
+    def _on_format_changed(self, fmt: str):
+        current = self.edit_path.text().strip()
+        if not current:
+            current = "export"
+        self.edit_path.setText(self._ensure_path_ext(current, fmt))
+
+    def _accept_with_normalized_path(self):
+        current = self.edit_path.text().strip()
+        if current:
+            self.edit_path.setText(self._ensure_path_ext(current, self.combo_format.currentText()))
+        self.accept()
 
     def get_values(self):
         return (
@@ -365,7 +433,14 @@ class ExportSettingsDialog(QDialog):
 
     def _browse_path(self):
         fmt = self.combo_format.currentText()
-                
-        path, _ = QFileDialog.getSaveFileName(self, "选择导出路径", "", "PNG Files (*.png);;JPG Files (*.jpg *.jpeg);;NIfTI Files (*.nii.gz *.nii);;All Files (*)")
+        current = self.edit_path.text().strip()
+        start_path = self._ensure_path_ext(current or "export", fmt)
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "选择导出路径",
+            start_path,
+            self._filter_for_format(fmt),
+        )
         if path:
-            self.edit_path.setText(path)
+            self.edit_path.setText(self._ensure_path_ext(path, fmt))

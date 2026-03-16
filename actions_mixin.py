@@ -80,6 +80,7 @@ class ActionsMixin:
             ct_cache_max=self.ct_cache_max,
             xray_prefetch_count=self.xray_prefetch_count,
             xray_cache_max=self.xray_cache_max,
+            xray_default_mask_format=getattr(self, "xray_default_mask_format", "png"),
         )
         if dlg.exec() == QDialog.Accepted:
             v = dlg.get_values()
@@ -88,6 +89,11 @@ class ActionsMixin:
             self.ct_cache_max = v["ct_cache_max"]
             self.xray_prefetch_count = v["xray_prefetch_count"]
             self.xray_cache_max = v["xray_cache_max"]
+            self.xray_default_mask_format = str(
+                v.get("xray_default_mask_format", getattr(self, "xray_default_mask_format", "png"))
+            ).strip().lower()
+            if self.xray_default_mask_format not in ("png", "nii"):
+                self.xray_default_mask_format = "png"
 
             # 当前生效的 cache_max 随模式切换
             active_max = (
@@ -237,6 +243,20 @@ class ActionsMixin:
         if fmt == "nii":
             return stem + "_mask.nii.gz"
         return stem + "_mask.png"
+
+    def _get_project_mask_format_preference(self):
+        fmt = str(getattr(self, "xray_default_mask_format", "png") or "png").strip().lower()
+        return "nii" if fmt in ("nii", "nii.gz", "nifti") else "png"
+
+    def _build_single_preview_default_mask_path(self, image_path: str) -> str:
+        base_dir = os.path.dirname(image_path)
+        filename = os.path.basename(image_path)
+        if filename.lower().endswith(".nii.gz"):
+            base_name = filename[:-7]
+        else:
+            base_name = os.path.splitext(filename)[0]
+        ext = ".nii.gz" if self._get_project_mask_format_preference() == "nii" else ".png"
+        return os.path.join(base_dir, f"{base_name}_mask{ext}")
 
     def _get_nifti_export_reference_path(self, entry):
         ref = getattr(self, "_single_pair_source_mask_path", None)
@@ -441,6 +461,51 @@ class ActionsMixin:
             return True, None
         return False, "导出图像失败"
 
+    def _resolve_xray_save_path(self, entry):
+        save_path = getattr(entry, "mask_path", "") or ""
+        preferred = self._get_project_mask_format_preference()
+        want_nifti = preferred == "nii"
+
+        # 已有文件存在 → 直接用，不切换格式
+        if save_path and os.path.exists(save_path):
+            return save_path
+
+        # single_pair_mode 有专用的默认路径构建
+        if self.single_pair_mode:
+            if not save_path:
+                return self._build_single_preview_default_mask_path(entry.orig_path)
+            lower = save_path.lower()
+            current_is_nifti = lower.endswith((".nii", ".nii.gz"))
+            if want_nifti != current_is_nifti:
+                return self._build_single_preview_default_mask_path(entry.orig_path)
+            return save_path
+
+        # 通用逻辑（CT / X-ray / 双文件夹）：掩码不存在时按偏好决定扩展名
+        if save_path:
+            lower = save_path.lower()
+            current_is_nifti = lower.endswith((".nii", ".nii.gz"))
+            if want_nifti and not current_is_nifti:
+                return self._switch_mask_ext_to_nifti(save_path)
+            if not want_nifti and current_is_nifti:
+                return self._switch_mask_ext_to_png(save_path)
+        return save_path
+
+    @staticmethod
+    def _switch_mask_ext_to_nifti(path):
+        for ext in (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"):
+            if path.lower().endswith(ext):
+                return path[:-len(ext)] + ".nii.gz"
+        return path + ".nii.gz"
+
+    @staticmethod
+    def _switch_mask_ext_to_png(path):
+        lower = path.lower()
+        if lower.endswith(".nii.gz"):
+            return path[:-7] + ".png"
+        if lower.endswith(".nii"):
+            return path[:-4] + ".png"
+        return path
+
     # ==========================================
     # CT 与通用保存逻辑
     # ==========================================
@@ -451,10 +516,14 @@ class ActionsMixin:
         entry = self.entries[self.current_idx]
         mask_to_save = self._mask_to_binary_uint8(self.canvas.mask)
 
-        save_path = entry.mask_path
+        save_path = self._resolve_xray_save_path(entry)
 
-        # 单对模式：如果原始加载的是 NIfTI，则保存时允许用户选择导出为 nii/nii.gz 或 png
-        if self.single_pair_mode and getattr(self, "_single_pair_source_mask_is_nifti", False):
+        # 单对模式：如果原始加载的是 NIfTI，或项目首选掩码格式就是 NIfTI，
+        # 则保存时允许用户显式选择导出为 nii/nii.gz 或 png
+        if self.single_pair_mode and (
+            getattr(self, "_single_pair_source_mask_is_nifti", False)
+            or self._get_project_mask_format_preference() == "nii"
+        ):
             base_dir = os.path.dirname(entry.orig_path)
             filename = os.path.basename(entry.orig_path)
 
@@ -506,21 +575,29 @@ class ActionsMixin:
         # 保存为 NIfTI 时继承原始空间信息（spacing / origin / direction）
         reference_mask_path = None
         if save_path.lower().endswith((".nii", ".nii.gz")):
-            if (
-                self.single_pair_mode
-                and getattr(self, "_single_pair_source_mask_is_nifti", False)
-            ):
-                reference_mask_path = getattr(self, "_single_pair_source_mask_path", None)
-            elif os.path.exists(save_path):
-                # [修复] 批量模式：目标 NIfTI 已存在时，用其自身作为空间参考，
-                # 避免写出后空间信息变为默认值，导致 read_mask_file 空间对齐失败
+            reference_mask_path = self._get_nifti_export_reference_path(entry)
+
+            if not reference_mask_path and os.path.exists(save_path):
                 reference_mask_path = save_path
+
+            # 兜底：第一次保存时用原图路径尝试继承空间信息
+            if not reference_mask_path:
+                reference_mask_path = entry.orig_path
 
         ok, err = self._write_mask_file_compat(
             save_path,
             mask_to_save,
             reference_mask_path=reference_mask_path,
         )
+
+        # [修复] 如果因为尺寸不匹配失败（DICOM 原图被 SimpleITK 读出的尺寸
+        # 可能与 pydicom/OpenCV 读出的画布尺寸不同），降级为不带空间信息保存。
+        if not ok and reference_mask_path and "不一致" in (err or ""):
+            ok, err = self._write_mask_file_compat(
+                save_path,
+                mask_to_save,
+                reference_mask_path=None,
+            )
 
         if ok:
             entry.mask_path = save_path
@@ -738,7 +815,7 @@ class ActionsMixin:
             mask_path and mask_path.lower().endswith((".nii", ".nii.gz"))
         )
 
-        export_mask_path = mask_path or os.path.join(base_dir, f"{base_name}_mask.png")
+        export_mask_path = mask_path or self._build_single_preview_default_mask_path(image_path)
         self.mask_root = os.path.dirname(export_mask_path)
 
         entry = ImageEntry(
@@ -797,8 +874,11 @@ class ActionsMixin:
         else:
             base_name = os.path.splitext(entry.filename)[0]
 
+        export_fmt = getattr(self, "last_export_format", "png")
+        export_fmt = export_fmt if export_fmt in ("png", "jpg", "nii") else "png"
+        export_ext = ".nii.gz" if export_fmt == "nii" else (".jpg" if export_fmt == "jpg" else ".png")
         default_path = os.path.join(
-            os.path.dirname(entry.orig_path), f"{base_name}.png"
+            os.path.dirname(entry.orig_path), f"{base_name}{export_ext}"
         )
 
         dialog = ExportSettingsDialog(
@@ -815,6 +895,7 @@ class ActionsMixin:
             return
 
         fmt = (fmt or "png").lower()
+        self.last_export_format = fmt
         out_path = self._ensure_export_path_ext(out_path, fmt)
         source_is_dicom = self._source_is_dicom_for_export(entry)
 

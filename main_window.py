@@ -80,6 +80,7 @@ class MedicalLabelPro(QMainWindow, UiMixin, DataMixin, ActionsMixin):
         self.ct_cache_max = 40  # CT 帧缓存上限
         self.xray_prefetch_count = 5  # X光前后病例预取数
         self.xray_cache_max = 12  # X光缓存上限
+        self.xray_default_mask_format = "png"  # X光项目级默认掩码格式
         self._settings = QSettings("CheXagent", "Penu")
         self._load_perf_settings()
         self._scan_process = None
@@ -131,6 +132,13 @@ class MedicalLabelPro(QMainWindow, UiMixin, DataMixin, ActionsMixin):
             1,
             1000,
         )
+        fmt = str(
+            self._settings.value(
+                "xray_default_mask_format",
+                getattr(self, "xray_default_mask_format", "png"),
+            )
+        ).strip().lower()
+        self.xray_default_mask_format = "nii" if fmt in ("nii", "nii.gz", "nifti") else "png"
 
     def _save_perf_settings(self):
         self._settings.setValue("ct_prefetch_count", int(self.ct_prefetch_count))
@@ -138,6 +146,10 @@ class MedicalLabelPro(QMainWindow, UiMixin, DataMixin, ActionsMixin):
         self._settings.setValue("ct_cache_max", int(self.ct_cache_max))
         self._settings.setValue("xray_prefetch_count", int(self.xray_prefetch_count))
         self._settings.setValue("xray_cache_max", int(self.xray_cache_max))
+        self._settings.setValue(
+            "xray_default_mask_format",
+            str(getattr(self, "xray_default_mask_format", "png")),
+        )
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():

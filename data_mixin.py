@@ -433,6 +433,72 @@ class DataMixin:
         # 回退：默认 PNG 路径
         return default_mask_path(p_mask, stem, DEFAULT_MASK_BITMAP_EXT)
 
+    # ------------------------------------------------------------------
+    # 数据加载核心：磁盘读取 / 缓存读取（不涉及任何 UI 操作）
+    # ------------------------------------------------------------------
+
+    def _read_entry_from_disk(self, entry):
+        """从磁盘读取 entry 的图像和掩码。
+
+        返回 (img, mask, meta) 三元组；读取失败时返回 None。
+        不操作缓存，不操作 UI，可在后台线程安全调用。
+        """
+        meta = None
+        result = read_dicom_with_window(entry.orig_path)
+        if result:
+            img, raw, wc, ww, (min_val, max_val) = result
+            meta = {"raw": raw, "wc": wc, "ww": ww, "min": min_val, "max": max_val}
+        else:
+            img = smart_read_image(entry.orig_path)
+
+        if img is None:
+            return None
+
+        mask = None
+        if os.path.exists(entry.mask_path):
+            # [修复] 当掩码是 NIfTI、原图是 DICOM 时，不传 reference_image_path。
+            # 原因：本应用保存的掩码与原图共享像素网格，target_shape 足以保证对齐；
+            # 而传入 DICOM 做参考会触发 read_mask_file 的物理空间重采样，
+            # 一旦 NIfTI 的 spacing 与 DICOM 不一致（写入时 CopyInformation 静默失败），
+            # 掩码就会被放大数倍。
+            # 用 meta is not None 判断比检查扩展名更可靠（能覆盖无扩展名的 DICOM）。
+            mask_is_nifti = entry.mask_path.lower().endswith((".nii", ".nii.gz"))
+            loaded_as_dicom = meta is not None
+            ref_path = None if (mask_is_nifti and loaded_as_dicom) else entry.orig_path
+
+            mask, _ = read_mask_file(
+                entry.mask_path,
+                target_shape=img.shape[:2],
+                reference_image_path=ref_path,
+            )
+        if mask is None:
+            mask = self._alloc_mask(img.shape[:2])
+
+        return img, mask, meta
+
+    def _load_entry_payload(self, entry):
+        """从缓存或磁盘加载 entry 的数据，返回 (img, mask, meta) 或 None。
+
+        优先命中缓存；未命中则从磁盘读取并写入缓存。不涉及 UI 操作。
+        """
+        key = entry.orig_path
+
+        # 缓存命中
+        cached = self._cache_get(key)
+        if cached:
+            img, mask = cached[0], cached[1]
+            meta = cached[2] if len(cached) >= 3 else None
+            return img, mask, meta
+
+        # 缓存未命中：磁盘读取
+        payload = self._read_entry_from_disk(entry)
+        if payload is None:
+            return None
+
+        img, mask, meta = payload
+        self._cache_set(key, (img, mask, meta))
+        return img, mask, meta
+
     def _build_prefetch_indices(self, current_idx):
         total = len(self.entries)
         if total <= 0 or self.ct_prefetch_count <= 0:
@@ -494,36 +560,11 @@ class DataMixin:
                 self._prefetch_inflight.add(key)
 
             try:
-                meta = None
-                result = read_dicom_with_window(entry.orig_path)
-                if result:
-                    img, raw, wc, ww, (min_val, max_val) = result
-                    meta = {
-                        "raw": raw,
-                        "wc": wc,
-                        "ww": ww,
-                        "min": min_val,
-                        "max": max_val,
-                    }
-                else:
-                    img = smart_read_image(entry.orig_path)
-
-                if img is None:
+                payload = self._read_entry_from_disk(entry)
+                if payload is None:
                     continue
-
-                mask = None
-                if os.path.exists(entry.mask_path):
-                    mask, _ = read_mask_file(
-                        entry.mask_path,
-                        target_shape=img.shape[:2],
-                        reference_image_path=entry.orig_path,
-                    )
-                if mask is None:
-                    mask = self._alloc_mask(img.shape[:2])
-                if meta:
-                    self._cache_set(key, (img, mask, meta))
-                else:
-                    self._cache_set(key, (img, mask))
+                img, mask, meta = payload
+                self._cache_set(key, (img, mask, meta))
             finally:
                 with self._cache_lock:
                     self._prefetch_inflight.discard(key)
@@ -695,34 +736,11 @@ class DataMixin:
                     continue
                 self._prefetch_inflight.add(key)
             try:
-                meta = None
-                result = read_dicom_with_window(entry.orig_path)
-                if result:
-                    img, raw, wc, ww, (min_val, max_val) = result
-                    meta = {
-                        "raw": raw,
-                        "wc": wc,
-                        "ww": ww,
-                        "min": min_val,
-                        "max": max_val,
-                    }
-                else:
-                    img = smart_read_image(entry.orig_path)
-                if img is None:
+                payload = self._read_entry_from_disk(entry)
+                if payload is None:
                     continue
-                mask = None
-                if os.path.exists(entry.mask_path):
-                    mask, _ = read_mask_file(
-                        entry.mask_path,
-                        target_shape=img.shape[:2],
-                        reference_image_path=entry.orig_path,
-                    )
-                if mask is None:
-                    mask = self._alloc_mask(img.shape[:2])
-                if meta:
-                    self._cache_set(key, (img, mask, meta))
-                else:
-                    self._cache_set(key, (img, mask))
+                img, mask, meta = payload
+                self._cache_set(key, (img, mask, meta))
             finally:
                 with self._cache_lock:
                     self._prefetch_inflight.discard(key)
@@ -754,50 +772,44 @@ class DataMixin:
         if path:
             self.load_task_json(path)
 
-    def load_task_json(self, json_path: str):
-        self._flush_labels_cache()
-        if hasattr(self, "_xray_dir_match_cache"):
-            self._xray_dir_match_cache.clear()
-        data = None
+    # ------------------------------------------------------------------
+    # load_task_json 拆分：数据层 helper（不碰 UI）
+    # ------------------------------------------------------------------
+
+    def _read_task_json(self, json_path):
+        """多编码读取 JSON 文件，返回 dict 或 None。"""
         for enc in ("utf-8-sig", "utf-8", "gbk"):
             try:
                 with open(json_path, "r", encoding=enc) as f:
                     data = json.load(f)
-                break
+                if isinstance(data, dict) and data:
+                    return data
             except Exception:
                 continue
+        return None
 
-        if not isinstance(data, dict) or not data:
-            QMessageBox.warning(self, "错误", "任务JSON为空或格式不正确")
-            return
-
-        self._scan_token += 1
-        if getattr(self, "_scan_timer", None):
-            self._scan_timer.stop()
-            self._scan_timer = None
-        self._internal_scan_queue = None
-        if getattr(self, "_scan_progress", None):
-            self._scan_progress.close()
-            self._scan_progress = None
-
+    def _resolve_task_base_dir(self, json_path, data):
+        """根据 JSON 路径和首条 entry 推断影像根目录。"""
         json_dir = os.path.dirname(json_path)
         base_dir = self.orig_root if self.orig_root else json_dir
 
-        if data:
-            first_rel = str(next(iter(data.keys()))).replace("\\", "/").lstrip("/")
-            if not os.path.isabs(first_rel):
-                old_path = os.path.join(base_dir, first_rel)
-                new_path = os.path.join(json_dir, first_rel)
-                if not os.path.exists(old_path) and os.path.exists(new_path):
-                    base_dir = json_dir
+        first_rel = str(next(iter(data.keys()))).replace("\\", "/").lstrip("/")
+        if not os.path.isabs(first_rel):
+            old_path = os.path.join(base_dir, first_rel)
+            new_path = os.path.join(json_dir, first_rel)
+            if not os.path.exists(old_path) and os.path.exists(new_path):
+                base_dir = json_dir
 
-        if not self.mask_root or self.mask_root == self.orig_root:
-            self.mask_root = base_dir
-        self.orig_root = base_dir
+        return base_dir
 
+    def _build_task_entries(self, data, base_dir):
+        """纯数据函数：从 JSON dict 构建 entry 列表。
+
+        返回 (entries, missing, task_key_map)。不操作 self 状态，不弹窗。
+        """
         entries = []
         missing = []
-        self.task_key_map = {}
+        task_key_map = {}
 
         for rel_path, label in data.items():
             rel_str = str(rel_path).replace("\\", "/").lstrip("/")
@@ -815,10 +827,7 @@ class DataMixin:
 
             if self.scan_mode == ScanMode.CT_SEQUENCE:
                 parts = rel_norm.split("/")
-                if len(parts) > 1:
-                    case_name = parts[0]
-                else:
-                    case_name = "Root"
+                case_name = parts[0] if len(parts) > 1 else "Root"
                 # [修复] 搜索已有掩码（含 NIfTI），而非硬编码 .png
                 mask_path = self._resolve_ct_mask_path(
                     full_src, self.mask_root, rel_norm
@@ -831,25 +840,28 @@ class DataMixin:
                     mask_path = self._build_default_xray_mask_path(full_src)
                 filename = os.path.basename(full_src)
 
-            has_mask = os.path.exists(mask_path)
-
             entry = ImageEntry(
                 case_name=case_name,
                 orig_path=full_src,
                 mask_path=mask_path,
                 filename=filename,
-                has_mask=has_mask,
+                has_mask=os.path.exists(mask_path),
                 has_pneumothorax=has_pneumo,
             )
             entries.append(entry)
-            self.task_key_map[entry.orig_path] = rel_path
+            task_key_map[entry.orig_path] = rel_path
 
-        if not entries:
-            QMessageBox.warning(self, "错误", "未找到可加载的任务影像")
-            return
+        return entries, missing, task_key_map
+
+    def _commit_task_context(self, json_path, base_dir, entries, task_key_map):
+        """将解析结果写入 self.task_* 状态，切换为任务模式。不弹窗。"""
+        if not self.mask_root or self.mask_root == self.orig_root:
+            self.mask_root = base_dir
+        self.orig_root = base_dir
 
         self.task_json_path = json_path
         self.task_entries = entries
+        self.task_key_map = task_key_map
         self.task_case_entries = {}
         self.task_case_order = []
 
@@ -861,6 +873,31 @@ class DataMixin:
 
         self.task_mode = True
         self._init_labels_cache()
+
+    # ------------------------------------------------------------------
+    # load_task_json：协调函数（唯一允许碰 UI 的入口）
+    # ------------------------------------------------------------------
+
+    def load_task_json(self, json_path: str):
+        self._flush_labels_cache()
+        if hasattr(self, "_xray_dir_match_cache"):
+            self._xray_dir_match_cache.clear()
+
+        data = self._read_task_json(json_path)
+        if data is None:
+            QMessageBox.warning(self, "错误", "任务JSON为空或格式不正确")
+            return
+
+        self._cancel_pending_scan()
+
+        base_dir = self._resolve_task_base_dir(json_path, data)
+        entries, missing, task_key_map = self._build_task_entries(data, base_dir)
+
+        if not entries:
+            QMessageBox.warning(self, "错误", "未找到可加载的任务影像")
+            return
+
+        self._commit_task_context(json_path, base_dir, entries, task_key_map)
         self._build_task_case_lists()
 
         if missing:
@@ -869,7 +906,12 @@ class DataMixin:
                 self, "提示", f"以下任务路径未找到:\n{sample}\n共 {len(missing)} 条"
             )
 
-    def _on_scan_cancelled(self):
+    def _cancel_pending_scan(self):
+        """中断正在进行的后台目录扫描。
+
+        递增 token 使旧扫描线程失效，停止轮询定时器，关闭进度对话框，
+        清空结果队列。可在 load_task_json / refresh_lists / 用户取消 等场景复用。
+        """
         self._scan_token += 1
         if getattr(self, "_scan_timer", None):
             self._scan_timer.stop()
@@ -878,6 +920,9 @@ class DataMixin:
         if getattr(self, "_scan_progress", None):
             self._scan_progress.close()
             self._scan_progress = None
+
+    def _on_scan_cancelled(self):
+        self._cancel_pending_scan()
         self.statusBar().showMessage("扫描已取消", 2000)
 
     def _build_task_case_lists(self):
@@ -1042,16 +1087,8 @@ class DataMixin:
 
         status_map = self._load_case_status()
 
-        self._scan_token += 1
+        self._cancel_pending_scan()
         token = self._scan_token
-
-        if getattr(self, "_scan_progress", None):
-            self._scan_progress.close()
-            self._scan_progress = None
-
-        if getattr(self, "_scan_timer", None):
-            self._scan_timer.stop()
-            self._scan_timer = None
 
         progress = QProgressDialog("正在扫描病例...", "取消", 0, 0, self)
         progress.setWindowModality(Qt.NonModal)
@@ -1102,8 +1139,13 @@ class DataMixin:
         else:
             self._start_cross_case_prefetch()
 
-    def load_case_sequence(self, item):
-        # [修复] 切换病例时立即推进预取 epoch，终止旧病例后台预取；同一病例内的不同预取类型互不取消。
+    # ------------------------------------------------------------------
+    # load_case_sequence 拆分
+    # ------------------------------------------------------------------
+
+    def _before_case_switch(self):
+        """切换病例前的收尾工作：保存、清空空掩码、推进预取 epoch。"""
+        # [修复] 切换病例时立即推进预取 epoch，终止旧病例后台预取
         self._next_prefetch_epoch()
 
         if self.autosave_enabled and self.current_idx >= 0 and self.canvas._is_dirty:
@@ -1112,9 +1154,9 @@ class DataMixin:
         if hasattr(self, "_cleanup_empty_masks"):
             self._cleanup_empty_masks()
 
-        case_name = item.data(Qt.UserRole)
+    def _reset_case_view_state(self, case_name):
+        """清空 UI 容器，重置索引，准备接收新病例数据。"""
         self.current_case_name = case_name
-
         self.entries.clear()
         self.thumbnail_strip.clear()
         self.current_idx = -1
@@ -1122,19 +1164,14 @@ class DataMixin:
         if hasattr(self, "info_panel") and hasattr(self.info_panel, "table"):
             self.info_panel.table.setRowCount(0)
 
-        files = self._build_case_entries(case_name)
-        self.entries = files
+    def _populate_case_navigation(self, files):
+        """根据扫描模式初始化缩略图占位符和 seek_slider。
 
-        # 性能优化：切病例时保留现有缓存，只推进 epoch 终止旧预取；
-        # 这样首帧命中缓存时不会被强制重新读盘。
-        self._reset_cache(clear_cache=False, invalidate_prefetch=False)
-
-        self.statusBar().showMessage(f"加载序列: {case_name} ({len(files)} 张)")
-
+        返回 thumb_token (CT 模式) 或 None (X-ray 模式)。
+        """
         is_ct = self.scan_mode == ScanMode.CT_SEQUENCE
         thumb_token = None
 
-        # CT 模式：先插入占位符，首帧显示后再启动缩略图与预取，避免首屏与后台 IO 抢盘。
         if is_ct:
             self._thumb_token = getattr(self, "_thumb_token", 0) + 1
             thumb_token = self._thumb_token
@@ -1163,6 +1200,26 @@ class DataMixin:
                 self.seek_slider.setEnabled(False)
         else:
             self.seek_slider.setEnabled(False)
+
+        return thumb_token
+
+    def load_case_sequence(self, item):
+        """协调函数：切换并加载一个病例的完整序列。"""
+        self._before_case_switch()
+
+        case_name = item.data(Qt.UserRole)
+        self._reset_case_view_state(case_name)
+
+        files = self._build_case_entries(case_name)
+        self.entries = files
+
+        # 性能优化：切病例时保留现有缓存，只推进 epoch 终止旧预取；
+        # 这样首帧命中缓存时不会被强制重新读盘。
+        self._reset_cache(clear_cache=False, invalidate_prefetch=False)
+
+        self.statusBar().showMessage(f"加载序列: {case_name} ({len(files)} 张)")
+
+        thumb_token = self._populate_case_navigation(files)
 
         if self.entries:
             self.load_image_at_index(0, start_background=False)
@@ -1199,10 +1256,14 @@ class DataMixin:
             if img_thumb is None:
                 return QIcon()
             if entry.has_mask and os.path.exists(entry.mask_path):
+                mask_is_nifti = entry.mask_path.lower().endswith((".nii", ".nii.gz"))
+                orig_is_dicom = entry.orig_path.lower().endswith((".dcm", ".dicom"))
+                ref_path = None if (mask_is_nifti and orig_is_dicom) else entry.orig_path
+
                 mask_img, _ = read_mask_file(
                     entry.mask_path,
                     target_shape=(80, 80),
-                    reference_image_path=entry.orig_path,
+                    reference_image_path=ref_path,
                 )
 
         img_thumb = cv2.resize(img_thumb, (80, 80), interpolation=cv2.INTER_AREA)
@@ -1287,36 +1348,11 @@ class DataMixin:
             self.thumbnail_strip.blockSignals(False)
 
         entry = self.entries[idx]
-        key = entry.orig_path
-        cached = self._cache_get(key)
-        meta = None
-        if cached:
-            img, mask = cached[0], cached[1]
-            if len(cached) >= 3:
-                meta = cached[2]
-        else:
-            result = read_dicom_with_window(entry.orig_path)
-            if result:
-                img, raw, wc, ww, (min_val, max_val) = result
-                meta = {"raw": raw, "wc": wc, "ww": ww, "min": min_val, "max": max_val}
-            else:
-                img = smart_read_image(entry.orig_path)
-            if img is None:
-                self.statusBar().showMessage(f"无法读取图片: {entry.filename}", 3000)
-                return
-            mask = None
-            if os.path.exists(entry.mask_path):
-                mask, _ = read_mask_file(
-                    entry.mask_path,
-                    target_shape=img.shape[:2],
-                    reference_image_path=entry.orig_path,
-                )
-            if mask is None:
-                mask = self._alloc_mask(img.shape[:2])
-            if meta:
-                self._cache_set(key, (img, mask, meta))
-            else:
-                self._cache_set(key, (img, mask))
+        payload = self._load_entry_payload(entry)
+        if payload is None:
+            self.statusBar().showMessage(f"无法读取图片: {entry.filename}", 3000)
+            return
+        img, mask, meta = payload
 
         if meta:
             center = (
