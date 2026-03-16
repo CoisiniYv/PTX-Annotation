@@ -481,13 +481,15 @@ class ActionsMixin:
             return save_path
 
         # 通用逻辑（CT / X-ray / 双文件夹）：掩码不存在时按偏好决定扩展名
-        if save_path:
-            lower = save_path.lower()
-            current_is_nifti = lower.endswith((".nii", ".nii.gz"))
-            if want_nifti and not current_is_nifti:
-                return self._switch_mask_ext_to_nifti(save_path)
-            if not want_nifti and current_is_nifti:
-                return self._switch_mask_ext_to_png(save_path)
+        if not save_path and hasattr(self, "_build_default_xray_mask_path"):
+            rel_src = None
+            if getattr(self, "orig_root", None) and getattr(entry, "orig_path", None):
+                try:
+                    rel_src = os.path.relpath(entry.orig_path, self.orig_root).replace("\\", "/")
+                except Exception:
+                    rel_src = None
+            save_path = self._build_default_xray_mask_path(entry.orig_path, rel_src=rel_src)
+
         return save_path
 
     @staticmethod

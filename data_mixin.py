@@ -253,6 +253,49 @@ class DataMixin:
         if has_mask_ext and self._is_generic_xray_mask_name(lower):
             return True
         return False
+    @classmethod
+    def _get_xray_composite_sidecar_source_stem(cls, filename):
+        """
+        识别这类复合侧车：
+            00000001.dcm.png  -> 00000001
+            abc.dicom.png     -> abc
+            img.jpg.png       -> img
+        返回“对应原图的 stem”；不是这类命名则返回 ""。
+        """
+        lower = os.path.basename(filename or "").lower()
+        if not lower.endswith(MASK_FILE_EXTENSIONS):
+            return ""
+
+        # 先去掉掩码扩展名（例如 .png / .nii.gz）
+        inner = cls._strip_compound_ext(lower)
+        # 再尝试去掉一层“原图扩展名”
+        src_stem = cls._strip_compound_ext(inner)
+
+        # 只有真的又剥掉了一层已知图像扩展名，才认为是复合侧车
+        if src_stem and src_stem != inner:
+            return os.path.basename(src_stem)
+
+        return ""
+
+    def _is_xray_mask_sidecar(self, filename):
+        lower = os.path.basename(filename).lower()
+        stem = self._get_xray_mask_stem(lower).lower()
+        has_mask_ext = lower.endswith(MASK_FILE_EXTENSIONS)
+
+        # NIfTI 在当前项目里始终按掩码侧车处理
+        if self._is_nifti_file(lower):
+            return True
+
+        # 新增：识别 *.dcm.png / *.dicom.png / *.jpg.png 这类复合扩展名侧车
+        if self._get_xray_composite_sidecar_source_stem(lower):
+            return True
+
+        # 原有规则保留
+        if has_mask_ext and stem.endswith("_mask"):
+            return True
+        if has_mask_ext and self._is_generic_xray_mask_name(lower):
+            return True
+        return False
 
     def _iter_xray_source_filenames(self, dir_path):
         if not dir_path or not os.path.isdir(dir_path):
@@ -266,6 +309,7 @@ class DataMixin:
         except OSError:
             return []
 
+        # 这里顺手统一成 compound-ext 语义，避免 os.path.splitext 单层剥皮误判
         base_names = set()
         for f in filenames:
             ext = os.path.splitext(f)[1].lower()
@@ -274,14 +318,14 @@ class DataMixin:
                 and ext != ".png"
                 and not self._is_xray_mask_sidecar(f)
             ):
-                base_names.add(os.path.splitext(f)[0])
+                base_names.add(self._strip_compound_ext(f))
 
         result = []
         for f in filenames:
             ext = os.path.splitext(f)[1].lower()
             if ext in ignored_exts or self._is_xray_mask_sidecar(f):
                 continue
-            if ext == ".png" and os.path.splitext(f)[0] in base_names:
+            if ext == ".png" and self._strip_compound_ext(f) in base_names:
                 continue
             result.append(f)
 
@@ -316,21 +360,20 @@ class DataMixin:
         used_masks = set()
         exact_exts = list(XRAY_MASK_CANDIDATE_EXTENSIONS)
 
-        def _candidate_paths(file_stem, rel_stem):
+        def _candidate_paths(file_stem, rel_stem, filename, rel_src):
             if dual_mode and self.mask_root:
                 base_rel = rel_stem.replace("\\", "/")
-                return [
-                    os.path.join(self.mask_root, base_rel + ext) for ext in exact_exts
-                ] + [
-                    os.path.join(self.mask_root, base_rel + "_mask" + ext)
-                    for ext in exact_exts
-                ]
-            return [
-                os.path.join(src_dir, file_stem + ext) for ext in exact_exts
-            ] + [
-                os.path.join(src_dir, file_stem + "_mask" + ext)
-                for ext in exact_exts
-            ]
+                rel_with_src_ext = rel_src.replace("\\", "/")
+                return (
+                    [os.path.join(self.mask_root, base_rel + ext) for ext in exact_exts]
+                    + [os.path.join(self.mask_root, base_rel + "_mask" + ext) for ext in exact_exts]
+                    + [os.path.join(self.mask_root, rel_with_src_ext + ext) for ext in exact_exts]
+                )
+            return (
+                [os.path.join(src_dir, file_stem + ext) for ext in exact_exts]
+                + [os.path.join(src_dir, file_stem + "_mask" + ext) for ext in exact_exts]
+                + [os.path.join(src_dir, filename + ext) for ext in exact_exts]
+            )
 
         unmatched = []
         for filename in source_filenames:
@@ -340,7 +383,7 @@ class DataMixin:
             rel_stem = self._strip_compound_ext(rel_src)
             chosen = ""
             seen = set()
-            for candidate in _candidate_paths(file_stem, rel_stem):
+            for candidate in _candidate_paths(file_stem, rel_stem, filename, rel_src):
                 if not candidate:
                     continue
                 norm_candidate = os.path.normpath(candidate)
@@ -622,10 +665,22 @@ class DataMixin:
             entries.extend(self._expand_case_to_entries(next_case))
         return entries
 
-    def _build_default_xray_mask_path(self, orig_path):
+    def _build_default_xray_mask_path(self, orig_path, rel_src=None):
         stem = self._strip_compound_ext(os.path.basename(orig_path))
-        mask_dir = self.mask_root or os.path.dirname(orig_path)
-        return default_mask_path(mask_dir, stem, DEFAULT_MASK_BITMAP_EXT)
+        rel_src = (rel_src or os.path.relpath(orig_path, self.orig_root)).replace("\\", "/")
+        rel_dir = os.path.dirname(rel_src)
+
+        if is_dual_folder_mode(self.orig_root, self.mask_root) and self.mask_root:
+            mask_dir = os.path.join(self.mask_root, rel_dir) if rel_dir else self.mask_root
+        else:
+            mask_dir = os.path.dirname(orig_path)
+
+        preferred = "png"
+        if hasattr(self, "_get_project_mask_format_preference"):
+            preferred = self._get_project_mask_format_preference()
+
+        ext = DEFAULT_NIFTI_EXT if preferred == "nii" else DEFAULT_MASK_BITMAP_EXT
+        return default_mask_path(mask_dir, stem, ext)
 
     def _build_xray_entry(self, full_src, case_name, filename=None, rel_src=None, has_pneumo=None):
         filename = filename or os.path.basename(full_src)
@@ -635,7 +690,7 @@ class DataMixin:
 
         mask_path = self._resolve_xray_mask_path(full_src, rel_src=rel_src)
         if not mask_path:
-            mask_path = self._build_default_xray_mask_path(full_src)
+            mask_path = self._build_default_xray_mask_path(full_src, rel_src=rel_src)
 
         return ImageEntry(
             case_name=case_name,
@@ -837,7 +892,7 @@ class DataMixin:
                 case_name = rel_norm
                 mask_path = self._resolve_xray_mask_path(full_src, rel_src=rel_norm)
                 if not mask_path:
-                    mask_path = self._build_default_xray_mask_path(full_src)
+                    mask_path = self._build_default_xray_mask_path(full_src, rel_src=rel_norm)
                 filename = os.path.basename(full_src)
 
             entry = ImageEntry(
