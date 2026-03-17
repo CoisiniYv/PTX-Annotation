@@ -1,16 +1,26 @@
 """交互动作：保存、标记、状态更新与快捷切换。"""
 
 import os
+import queue
 import shutil
 import tempfile
+import threading
 import uuid
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
 import SimpleITK as sitk
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QDialog, QFileDialog, QListWidgetItem, QMessageBox
+from PySide6.QtWidgets import (
+    QDialog,
+    QFileDialog,
+    QListWidgetItem,
+    QMessageBox,
+    QProgressDialog,
+)
 
 from models import ImageEntry, ScanMode
 from utils import (
@@ -22,7 +32,13 @@ from utils import (
     smart_read_image,
     write_mask_file,
 )
-from widgets import ExportSettingsDialog, PrefetchSettingsDialog
+from tools import mask_audit, pa_filter
+from widgets import (
+    ExportSettingsDialog,
+    MaskAuditDialog,
+    PaFilterDialog,
+    PrefetchSettingsDialog,
+)
 
 
 class ActionsMixin:
@@ -1067,6 +1083,394 @@ class ActionsMixin:
     # ==========================================
     # 快捷切换逻辑
     # ==========================================
+
+    # ==========================================
+    # 工具：PA 筛选 / 掩码审计
+    # ==========================================
+    def open_pa_filter_tool(self):
+        dlg = PaFilterDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        vals = dlg.get_values()
+        if not vals.get("source_dir"):
+            QMessageBox.warning(self, "提示", "请先选择源 DICOM 目录")
+            return
+
+        source_dir = Path(vals["source_dir"]).expanduser().resolve()
+        if not source_dir.exists():
+            QMessageBox.warning(self, "提示", f"源目录不存在: {source_dir}")
+            return
+
+        target_dir = (
+            Path(vals["target_dir"]).expanduser().resolve()
+            if vals.get("target_dir")
+            else None
+        )
+        move_dir = (
+            Path(vals["move_excluded_dir"]).expanduser().resolve()
+            if vals.get("move_excluded_dir")
+            else None
+        )
+
+        if target_dir and target_dir == source_dir:
+            QMessageBox.warning(self, "提示", "源目录与 PA 输出目录不能相同")
+            return
+        if move_dir and move_dir == source_dir:
+            QMessageBox.warning(self, "提示", "源目录与移动目录不能相同")
+            return
+        if target_dir and move_dir and target_dir == move_dir:
+            QMessageBox.warning(self, "提示", "PA 输出目录与移动目录不能相同")
+            return
+
+        params = {
+            "source_dir": source_dir,
+            "target_dir": target_dir,
+            "move_excluded_dir": move_dir,
+            "report": bool(vals.get("report", False)),
+            "dry_run": bool(vals.get("dry_run", True)),
+        }
+        self._start_pa_filter_task(params)
+
+    def open_mask_audit_tool(self):
+        dlg = MaskAuditDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        vals = dlg.get_values()
+        mode = vals.get("mode", "audit")
+
+        if mode == "restore":
+            manifest_path = vals.get("manifest_path", "").strip()
+            if not manifest_path:
+                QMessageBox.warning(self, "提示", "请先选择 manifest 文件")
+                return
+            manifest = Path(manifest_path).expanduser().resolve()
+            if not manifest.exists():
+                QMessageBox.warning(self, "提示", f"manifest 不存在: {manifest}")
+                return
+        else:
+            root = vals.get("root", "").strip()
+            json_path = vals.get("json_path", "").strip()
+            if not root or not json_path:
+                QMessageBox.warning(self, "提示", "请先选择 root 目录与 JSON 文件")
+                return
+            root_path = Path(root).expanduser().resolve()
+            json_file = Path(json_path).expanduser().resolve()
+            if not root_path.exists() or not root_path.is_dir():
+                QMessageBox.warning(self, "提示", f"root 目录无效: {root_path}")
+                return
+            if not json_file.exists():
+                QMessageBox.warning(self, "提示", f"JSON 文件不存在: {json_file}")
+                return
+
+        self._start_mask_audit_task(vals)
+
+    def _start_pa_filter_task(self, params):
+        self._cancel_pa_filter_task()
+        self._pa_filter_token = getattr(self, "_pa_filter_token", 0) + 1
+        token = self._pa_filter_token
+
+        progress = QProgressDialog("正在筛选 PA 位...", "取消", 0, 0, self)
+        progress.setWindowModality(Qt.NonModal)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+        self._pa_filter_progress = progress
+        progress.canceled.connect(lambda: self._cancel_pa_filter_task(user_cancel=True))
+
+        self._pa_filter_queue = queue.Queue()
+        t = threading.Thread(
+            target=self._pa_filter_worker,
+            args=(token, params, self._pa_filter_queue),
+            daemon=True,
+        )
+        self._pa_filter_thread = t
+        t.start()
+
+        timer = QTimer(self)
+        timer.setInterval(200)
+        timer.timeout.connect(lambda: self._poll_pa_filter_result(token))
+        timer.start()
+        self._pa_filter_timer = timer
+
+    def _pa_filter_worker(self, token, params, result_queue):
+        try:
+            source_dir = params["source_dir"]
+            target_dir = params.get("target_dir")
+            move_dir = params.get("move_excluded_dir")
+            report = params.get("report", False)
+            dry_run = params.get("dry_run", True)
+
+            dicom_files = pa_filter.scan_dicom_files(source_dir)
+            if not dicom_files:
+                result_queue.put({"ok": False, "message": "未找到任何 DICOM 文件"})
+                return
+
+            pa_files, all_files_info = pa_filter.filter_pa_views(dicom_files)
+            pa_set = set(pa_files)
+            excluded_files = [f for f, _ in all_files_info if f not in pa_set]
+
+            report_path = None
+            if report:
+                report_dir = target_dir or move_dir or source_dir
+                report_dir.mkdir(parents=True, exist_ok=True)
+                report_path = report_dir / "pa_filter_report.txt"
+                pa_filter.generate_report(
+                    all_files_info, pa_files, report_path, source_dir
+                )
+
+            if not dry_run:
+                if target_dir and pa_files:
+                    pa_filter.copy_pa_files(pa_files, source_dir, target_dir)
+                if move_dir and excluded_files:
+                    pa_filter.move_files_preserving_structure(
+                        excluded_files, source_dir, move_dir
+                    )
+
+            result_queue.put(
+                {
+                    "ok": True,
+                    "total": len(all_files_info),
+                    "pa_count": len(pa_files),
+                    "excluded_count": len(excluded_files),
+                    "report_path": str(report_path) if report_path else "",
+                    "copied": bool(target_dir and not dry_run),
+                    "moved": bool(move_dir and not dry_run),
+                }
+            )
+        except Exception as e:
+            result_queue.put({"ok": False, "message": str(e)})
+
+    def _poll_pa_filter_result(self, token):
+        if token != getattr(self, "_pa_filter_token", None):
+            return
+        q = getattr(self, "_pa_filter_queue", None)
+        if not q:
+            return
+        try:
+            result = q.get_nowait()
+        except queue.Empty:
+            return
+
+        if getattr(self, "_pa_filter_timer", None):
+            self._pa_filter_timer.stop()
+            self._pa_filter_timer = None
+        if getattr(self, "_pa_filter_progress", None):
+            self._pa_filter_progress.close()
+            self._pa_filter_progress = None
+        self._pa_filter_queue = None
+
+        if not result.get("ok"):
+            QMessageBox.warning(self, "PA 筛选失败", result.get("message", "未知错误"))
+            return
+
+        msg = [
+            f"总文件数: {result.get('total', 0)}",
+            f"PA 位文件数: {result.get('pa_count', 0)}",
+            f"其他体位文件数: {result.get('excluded_count', 0)}",
+        ]
+        if result.get("report_path"):
+            msg.append(f"报告路径: {result['report_path']}")
+        if result.get("copied"):
+            msg.append("已执行 PA 文件复制")
+        if result.get("moved"):
+            msg.append("已执行非 PA 文件移动")
+
+        QMessageBox.information(self, "PA 筛选完成", "\n".join(msg))
+
+    def _cancel_pa_filter_task(self, user_cancel: bool = False):
+        self._pa_filter_token = getattr(self, "_pa_filter_token", 0) + 1
+        if getattr(self, "_pa_filter_timer", None):
+            self._pa_filter_timer.stop()
+            self._pa_filter_timer = None
+        if getattr(self, "_pa_filter_progress", None):
+            self._pa_filter_progress.close()
+            self._pa_filter_progress = None
+        self._pa_filter_queue = None
+        if user_cancel:
+            self.statusBar().showMessage("PA 筛选已取消", 2000)
+
+    def _start_mask_audit_task(self, params):
+        self._cancel_mask_audit_task()
+        self._mask_audit_token = getattr(self, "_mask_audit_token", 0) + 1
+        token = self._mask_audit_token
+
+        progress = QProgressDialog("正在执行掩码/JSON 审计...", "取消", 0, 0, self)
+        progress.setWindowModality(Qt.NonModal)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+        self._mask_audit_progress = progress
+        progress.canceled.connect(lambda: self._cancel_mask_audit_task(user_cancel=True))
+
+        self._mask_audit_queue = queue.Queue()
+        t = threading.Thread(
+            target=self._mask_audit_worker,
+            args=(token, params, self._mask_audit_queue),
+            daemon=True,
+        )
+        self._mask_audit_thread = t
+        t.start()
+
+        timer = QTimer(self)
+        timer.setInterval(200)
+        timer.timeout.connect(lambda: self._poll_mask_audit_result(token))
+        timer.start()
+        self._mask_audit_timer = timer
+
+    def _mask_audit_worker(self, token, params, result_queue):
+        try:
+            mode = params.get("mode", "audit")
+            if mode == "restore":
+                manifest = Path(params.get("manifest_path", "")).expanduser().resolve()
+                restored, items, errors = mask_audit.restore_from_manifest(
+                    manifest,
+                    overwrite=bool(params.get("overwrite", False)),
+                )
+                result_queue.put(
+                    {
+                        "ok": True,
+                        "mode": "restore",
+                        "restored": restored,
+                        "errors": errors,
+                    }
+                )
+                return
+
+            root = Path(params.get("root", "")).expanduser().resolve()
+            json_path = Path(params.get("json_path", "")).expanduser().resolve()
+            report_out = params.get("report_out", "").strip()
+            report_path = (
+                Path(report_out).expanduser().resolve()
+                if report_out
+                else root / "mask_audit_report.json"
+            )
+            quarantine_mode = params.get("quarantine_mode", "none")
+            quarantine_dir = params.get("quarantine_dir", "").strip()
+            quarantine_path = (
+                Path(quarantine_dir).expanduser().resolve()
+                if quarantine_dir
+                else root / "mask_quarantine"
+            )
+
+            mapping = mask_audit.load_json_mapping(json_path)
+            report = mask_audit.audit_masks(root, mapping)
+            mask_audit.save_json(report, report_path)
+
+            corrected_path = ""
+            corrected_stats = None
+            if params.get("write_corrected"):
+                out_path = params.get("corrected_path", "").strip()
+                if not out_path:
+                    out_path = str(root / "labels_corrected.json")
+                corrected_path = str(Path(out_path).expanduser().resolve())
+                corrected_mapping, corrected_stats = mask_audit.build_corrected_mapping(
+                    original_mapping=mapping,
+                    report=report,
+                    sync_both_ways=bool(params.get("sync_both_ways", False)),
+                )
+                mask_audit.save_corrected_mapping(
+                    corrected_mapping, Path(corrected_path)
+                )
+
+            manifest_path = ""
+            manifest_errors = []
+            if quarantine_mode in ("copy", "move"):
+                manifest, manifest_errors = mask_audit.quarantine_wrong_zero_masks(
+                    report,
+                    root,
+                    quarantine_path,
+                    mode=quarantine_mode,
+                )
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                manifest_path = str(
+                    (quarantine_path / f"manifest_{ts}.json").resolve()
+                )
+                mask_audit.save_json(manifest, Path(manifest_path))
+
+            result_queue.put(
+                {
+                    "ok": True,
+                    "mode": "audit",
+                    "summary": report.get("summary", {}),
+                    "report_path": str(report_path),
+                    "corrected_path": corrected_path,
+                    "corrected_stats": corrected_stats or {},
+                    "manifest_path": manifest_path,
+                    "manifest_errors": manifest_errors,
+                }
+            )
+        except Exception as e:
+            result_queue.put({"ok": False, "message": str(e)})
+
+    def _poll_mask_audit_result(self, token):
+        if token != getattr(self, "_mask_audit_token", None):
+            return
+        q = getattr(self, "_mask_audit_queue", None)
+        if not q:
+            return
+        try:
+            result = q.get_nowait()
+        except queue.Empty:
+            return
+
+        if getattr(self, "_mask_audit_timer", None):
+            self._mask_audit_timer.stop()
+            self._mask_audit_timer = None
+        if getattr(self, "_mask_audit_progress", None):
+            self._mask_audit_progress.close()
+            self._mask_audit_progress = None
+        self._mask_audit_queue = None
+
+        if not result.get("ok"):
+            QMessageBox.warning(
+                self, "掩码/JSON 审计失败", result.get("message", "未知错误")
+            )
+            return
+
+        if result.get("mode") == "restore":
+            errors = result.get("errors") or []
+            msg = [f"成功恢复: {result.get('restored', 0)}"]
+            if errors:
+                msg.append(f"恢复错误: {len(errors)} 条")
+            QMessageBox.information(self, "恢复完成", "\n".join(msg))
+            return
+
+        summary = result.get("summary", {})
+        msg = [
+            f"总例数: {summary.get('total_cases', 0)}",
+            f"标记 1 的例数: {summary.get('label_1_cases', 0)}",
+            f"标记 0 的例数: {summary.get('label_0_cases', 0)}",
+            f"实际有掩码: {summary.get('actual_has_mask_cases', 0)}",
+            f"1 且有掩码: {summary.get('label_1_and_found_mask', 0)}",
+            f"1 但无掩码: {summary.get('label_1_but_missing_mask', 0)}",
+            f"0 但有掩码: {summary.get('label_0_but_found_mask', 0)}",
+            f"0 且无掩码: {summary.get('label_0_and_no_mask', 0)}",
+            f"报告路径: {result.get('report_path', '')}",
+        ]
+
+        if result.get("corrected_path"):
+            msg.append(f"纠正 JSON: {result.get('corrected_path')}")
+        if result.get("manifest_path"):
+            msg.append(f"manifest: {result.get('manifest_path')}")
+        if result.get("manifest_errors"):
+            msg.append(f"隔离错误: {len(result.get('manifest_errors'))} 条")
+
+        QMessageBox.information(self, "审计完成", "\n".join(msg))
+
+    def _cancel_mask_audit_task(self, user_cancel: bool = False):
+        self._mask_audit_token = getattr(self, "_mask_audit_token", 0) + 1
+        if getattr(self, "_mask_audit_timer", None):
+            self._mask_audit_timer.stop()
+            self._mask_audit_timer = None
+        if getattr(self, "_mask_audit_progress", None):
+            self._mask_audit_progress.close()
+            self._mask_audit_progress = None
+        self._mask_audit_queue = None
+        if user_cancel:
+            self.statusBar().showMessage("掩码/JSON 审计已取消", 2000)
+
     def prev_image(self):
         if self.current_idx > 0:
             self.load_image_at_index(self.current_idx - 1)

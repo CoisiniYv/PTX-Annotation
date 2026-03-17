@@ -267,6 +267,17 @@ class UiMixin:
         act_help.triggered.connect(self._show_load_help)
         menu.addAction(act_help)
 
+    def _init_tools_menu(self):
+        menu = self.menuBar().addMenu("整理操作")
+
+        act_pa = QAction("PA 筛选", self)
+        act_pa.triggered.connect(self.open_pa_filter_tool)
+        menu.addAction(act_pa)
+
+        act_mask_audit = QAction("掩码/JSON 审计", self)
+        act_mask_audit.triggered.connect(self.open_mask_audit_tool)
+        menu.addAction(act_mask_audit)
+
     def _show_load_help(self):
         text = """数据加载方式说明
 一、CT 序列模式（默认）

@@ -57,6 +57,7 @@ class MedicalLabelPro(QMainWindow, UiMixin, DataMixin, ActionsMixin):
         self._init_toolbar()
         self._init_shortcuts()
         self._init_file_menu()
+        self._init_tools_menu()
         self._init_window_menu()
         self._connect_canvas_signals()  # 连接 canvas.file_dropped → _on_mask_file_dropped
 

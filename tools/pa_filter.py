@@ -629,7 +629,7 @@ def main():
 
     if args.report:
         report_dir = target_dir if target_dir else (move_excluded_dir if move_excluded_dir else source_dir)
-        report_path = report_dir / "筛选报告.txt"
+        report_path = report_dir / "pa_filter_report.txt"
         report_dir.mkdir(parents=True, exist_ok=True)
         generate_report(all_files_info, pa_files, report_path, source_dir)
 

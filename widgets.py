@@ -1,6 +1,7 @@
 """界面组件：信息面板与可视化控制条。"""
 
 import numpy as np
+from pathlib import Path
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -444,3 +446,222 @@ class ExportSettingsDialog(QDialog):
         )
         if path:
             self.edit_path.setText(self._ensure_path_ext(path, fmt))
+
+
+class PaFilterDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("PA 位筛选")
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.edit_source = QLineEdit()
+        btn_source = QPushButton("浏览")
+        btn_source.clicked.connect(lambda: self._browse_dir(self.edit_source))
+        row_source = QHBoxLayout()
+        row_source.addWidget(self.edit_source)
+        row_source.addWidget(btn_source)
+        form.addRow("源 DICOM 目录", row_source)
+
+        self.edit_target = QLineEdit()
+        btn_target = QPushButton("浏览")
+        btn_target.clicked.connect(lambda: self._browse_dir(self.edit_target))
+        row_target = QHBoxLayout()
+        row_target.addWidget(self.edit_target)
+        row_target.addWidget(btn_target)
+        form.addRow("PA 文件输出目录(可选)", row_target)
+
+        self.edit_excluded = QLineEdit()
+        btn_excluded = QPushButton("浏览")
+        btn_excluded.clicked.connect(lambda: self._browse_dir(self.edit_excluded))
+        row_excluded = QHBoxLayout()
+        row_excluded.addWidget(self.edit_excluded)
+        row_excluded.addWidget(btn_excluded)
+        form.addRow("非 PA 文件移动目录(可选)", row_excluded)
+
+        self.check_report = QCheckBox("生成筛选报告")
+        self.check_report.setChecked(True)
+        form.addRow("报告", self.check_report)
+
+        self.check_dry_run = QCheckBox("仅扫描不复制/移动")
+        self.check_dry_run.setChecked(True)
+        form.addRow("dry-run", self.check_dry_run)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setMinimumWidth(480)
+
+    def _browse_dir(self, edit: QLineEdit):
+        path = QFileDialog.getExistingDirectory(self, "选择目录")
+        if path:
+            edit.setText(path)
+
+    def get_values(self):
+        return {
+            "source_dir": self.edit_source.text().strip(),
+            "target_dir": self.edit_target.text().strip(),
+            "move_excluded_dir": self.edit_excluded.text().strip(),
+            "report": self.check_report.isChecked(),
+            "dry_run": self.check_dry_run.isChecked(),
+        }
+
+
+class MaskAuditDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("掩码/JSON 审计")
+        layout = QVBoxLayout(self)
+
+        self.tabs = QTabWidget()
+        self.tab_audit = QWidget()
+        self.tab_restore = QWidget()
+
+        self._build_audit_tab()
+        self._build_restore_tab()
+
+        self.tabs.addTab(self.tab_audit, "审计")
+        self.tabs.addTab(self.tab_restore, "恢复")
+        layout.addWidget(self.tabs)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setMinimumWidth(520)
+
+    def _build_audit_tab(self):
+        form = QFormLayout(self.tab_audit)
+
+        self.edit_root = QLineEdit()
+        btn_root = QPushButton("浏览")
+        btn_root.clicked.connect(self._browse_root)
+        row_root = QHBoxLayout()
+        row_root.addWidget(self.edit_root)
+        row_root.addWidget(btn_root)
+        form.addRow("root 目录", row_root)
+
+        self.edit_json = QLineEdit()
+        btn_json = QPushButton("浏览")
+        btn_json.clicked.connect(self._browse_json)
+        row_json = QHBoxLayout()
+        row_json.addWidget(self.edit_json)
+        row_json.addWidget(btn_json)
+        form.addRow("标注 JSON", row_json)
+
+        self.edit_report = QLineEdit()
+        btn_report = QPushButton("浏览")
+        btn_report.clicked.connect(self._browse_report)
+        row_report = QHBoxLayout()
+        row_report.addWidget(self.edit_report)
+        row_report.addWidget(btn_report)
+        form.addRow("报告输出", row_report)
+
+        self.combo_quarantine = QComboBox()
+        self.combo_quarantine.addItem("仅报告", "none")
+        self.combo_quarantine.addItem("复制到隔离区", "copy")
+        self.combo_quarantine.addItem("移动到隔离区", "move")
+        form.addRow("错误掩码处理", self.combo_quarantine)
+
+        self.edit_quarantine_dir = QLineEdit()
+        btn_quarantine = QPushButton("浏览")
+        btn_quarantine.clicked.connect(self._browse_quarantine)
+        row_quarantine = QHBoxLayout()
+        row_quarantine.addWidget(self.edit_quarantine_dir)
+        row_quarantine.addWidget(btn_quarantine)
+        form.addRow("隔离目录", row_quarantine)
+
+        self.check_corrected = QCheckBox("生成纠正后 JSON")
+        self.check_corrected.toggled.connect(self._toggle_corrected)
+        form.addRow("纠正 JSON", self.check_corrected)
+
+        self.edit_corrected = QLineEdit()
+        btn_corrected = QPushButton("浏览")
+        btn_corrected.clicked.connect(self._browse_corrected)
+        row_corrected = QHBoxLayout()
+        row_corrected.addWidget(self.edit_corrected)
+        row_corrected.addWidget(btn_corrected)
+        form.addRow("纠正输出", row_corrected)
+
+        self.check_sync_both = QCheckBox("双向同步(有掩码->1, 无掩码->0)")
+        form.addRow("同步策略", self.check_sync_both)
+
+        self._toggle_corrected(False)
+
+    def _build_restore_tab(self):
+        form = QFormLayout(self.tab_restore)
+
+        self.edit_manifest = QLineEdit()
+        btn_manifest = QPushButton("浏览")
+        btn_manifest.clicked.connect(self._browse_manifest)
+        row_manifest = QHBoxLayout()
+        row_manifest.addWidget(self.edit_manifest)
+        row_manifest.addWidget(btn_manifest)
+        form.addRow("manifest", row_manifest)
+
+        self.check_overwrite = QCheckBox("覆盖已存在文件")
+        form.addRow("覆盖", self.check_overwrite)
+
+    def _browse_root(self):
+        path = QFileDialog.getExistingDirectory(self, "选择 root 目录")
+        if path:
+            self.edit_root.setText(path)
+            self._fill_default_paths(Path(path))
+
+    def _browse_json(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择 JSON 文件", "", "JSON Files (*.json)")
+        if path:
+            self.edit_json.setText(path)
+
+    def _browse_report(self):
+        start = self.edit_report.text().strip() or "mask_audit_report.json"
+        path, _ = QFileDialog.getSaveFileName(self, "输出报告", start, "JSON Files (*.json)")
+        if path:
+            self.edit_report.setText(path)
+
+    def _browse_quarantine(self):
+        path = QFileDialog.getExistingDirectory(self, "选择隔离目录")
+        if path:
+            self.edit_quarantine_dir.setText(path)
+
+    def _browse_corrected(self):
+        start = self.edit_corrected.text().strip() or "labels_corrected.json"
+        path, _ = QFileDialog.getSaveFileName(self, "输出纠正 JSON", start, "JSON Files (*.json)")
+        if path:
+            self.edit_corrected.setText(path)
+
+    def _browse_manifest(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择 manifest", "", "JSON Files (*.json)")
+        if path:
+            self.edit_manifest.setText(path)
+
+    def _fill_default_paths(self, root: Path):
+        if not self.edit_report.text().strip():
+            self.edit_report.setText(str(root / "mask_audit_report.json"))
+        if not self.edit_quarantine_dir.text().strip():
+            self.edit_quarantine_dir.setText(str(root / "mask_quarantine"))
+        if not self.edit_corrected.text().strip():
+            self.edit_corrected.setText(str(root / "labels_corrected.json"))
+
+    def _toggle_corrected(self, checked: bool):
+        self.edit_corrected.setEnabled(checked)
+        self.check_sync_both.setEnabled(checked)
+
+    def get_values(self):
+        mode = "audit" if self.tabs.currentWidget() == self.tab_audit else "restore"
+        return {
+            "mode": mode,
+            "root": self.edit_root.text().strip(),
+            "json_path": self.edit_json.text().strip(),
+            "report_out": self.edit_report.text().strip(),
+            "quarantine_mode": self.combo_quarantine.currentData(),
+            "quarantine_dir": self.edit_quarantine_dir.text().strip(),
+            "write_corrected": self.check_corrected.isChecked(),
+            "corrected_path": self.edit_corrected.text().strip(),
+            "sync_both_ways": self.check_sync_both.isChecked(),
+            "manifest_path": self.edit_manifest.text().strip(),
+            "overwrite": self.check_overwrite.isChecked(),
+        }
