@@ -6,8 +6,10 @@ DICOM 胸部 X 光片 PA 位筛选工具（支持中英文识别）。
 
 from __future__ import annotations
 
+import builtins
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -18,6 +20,22 @@ except ImportError:  # pragma: no cover - 仅在缺失依赖时走到
 
 import pydicom
 from tqdm import tqdm
+
+
+def _has_stream(stream) -> bool:
+    return stream is not None and hasattr(stream, "write")
+
+
+def safe_print(*args, **kwargs):
+    if _has_stream(getattr(sys, "stdout", None)):
+        builtins.print(*args, **kwargs)
+
+
+def safe_tqdm(iterable, **kwargs):
+    stream = getattr(sys, "stderr", None)
+    if not _has_stream(stream):
+        return iterable
+    return tqdm(iterable, file=stream, **kwargs)
 
 
 def decode_bytes_to_str(value) -> Optional[str]:
@@ -207,7 +225,7 @@ def get_view_position(dcm_path: Path) -> Optional[str]:
         return None
 
     except Exception as e:
-        print(f"读取文件失败 {dcm_path}: {e}")
+        safe_print(f"读取文件失败 {dcm_path}: {e}")
         return None
 
 
@@ -340,7 +358,7 @@ def scan_dicom_files(source_dir: Path) -> List[Path]:
     dicom_extensions = {".dcm", ".dicom", ".DCM", ".DICOM"}
     dicom_files: List[Path] = []
 
-    print(f"正在扫描目录: {source_dir}")
+    safe_print(f"正在扫描目录: {source_dir}")
     for ext in dicom_extensions:
         dicom_files.extend(source_dir.rglob(f"*{ext}"))
 
@@ -356,7 +374,7 @@ def scan_dicom_files(source_dir: Path) -> List[Path]:
 
     dicom_files = list(dict.fromkeys(dicom_files))
 
-    print(f"扫描完成，找到 {len(dicom_files)} 个文件")
+    safe_print(f"扫描完成，找到 {len(dicom_files)} 个文件")
     return dicom_files
 
 
@@ -367,15 +385,15 @@ def filter_pa_views(
     pa_files: List[Path] = []
     all_files_info: List[Tuple[Path, Optional[str]]] = []
 
-    print("\n正在分析 DICOM 文件...")
-    for dcm_path in tqdm(dicom_files, desc="读取 DICOM 元数据"):
+    safe_print("\n正在分析 DICOM 文件...")
+    for dcm_path in safe_tqdm(dicom_files, desc="读取 DICOM 元数据"):
         view_pos = get_view_position(dcm_path)
         all_files_info.append((dcm_path, view_pos))
 
         if len(all_files_info) <= 10:
-            print(f"调试 - 文件: {dcm_path.name}")
-            print(f"      识别结果: {view_pos}")
-            print(f"      是否 PA 位? {is_pa_view(view_pos)}")
+            safe_print(f"调试 - 文件: {dcm_path.name}")
+            safe_print(f"      识别结果: {view_pos}")
+            safe_print(f"      是否 PA 位? {is_pa_view(view_pos)}")
 
         if is_pa_view(view_pos):
             pa_files.append(dcm_path)
@@ -386,17 +404,17 @@ def filter_pa_views(
 def copy_pa_files(pa_files: List[Path], source_dir: Path, target_dir: Path):
     """复制 PA 位 DICOM 文件到目标目录，保持原有目录结构。"""
     if not pa_files:
-        print("未找到符合条件的 PA 位文件")
+        safe_print("未找到符合条件的 PA 位文件")
         return
 
-    print(f"\n找到 {len(pa_files)} 个 PA 位文件，开始复制...")
+    safe_print(f"\n找到 {len(pa_files)} 个 PA 位文件，开始复制...")
 
     target_dir.mkdir(parents=True, exist_ok=True)
 
     success_count = 0
     failed_count = 0
 
-    for src_path in tqdm(pa_files, desc="复制文件"):
+    for src_path in safe_tqdm(pa_files, desc="复制文件"):
         try:
             relative_path = src_path.relative_to(source_dir)
             dest_path = target_dir / relative_path
@@ -407,13 +425,13 @@ def copy_pa_files(pa_files: List[Path], source_dir: Path, target_dir: Path):
                 success_count += 1
 
         except Exception as e:
-            print(f"复制文件失败 {src_path}: {e}")
+            safe_print(f"复制文件失败 {src_path}: {e}")
             failed_count += 1
 
-    print(f"\n复制完成！成功复制 {success_count} 个文件")
+    safe_print(f"\n复制完成！成功复制 {success_count} 个文件")
     if failed_count > 0:
-        print(f"失败 {failed_count} 个文件")
-    print(f"文件已保存到: {target_dir}")
+        safe_print(f"失败 {failed_count} 个文件")
+    safe_print(f"文件已保存到: {target_dir}")
 
 
 def move_files_preserving_structure(
@@ -423,17 +441,17 @@ def move_files_preserving_structure(
 ):
     """移动文件到目标目录，保持原有目录结构。"""
     if not files:
-        print("未找到需要移动的文件")
+        safe_print("未找到需要移动的文件")
         return
 
-    print(f"\n找到 {len(files)} 个文件需要移动，开始移动...")
+    safe_print(f"\n找到 {len(files)} 个文件需要移动，开始移动...")
 
     target_dir.mkdir(parents=True, exist_ok=True)
 
     success_count = 0
     failed_count = 0
 
-    for src_path in tqdm(files, desc="移动文件"):
+    for src_path in safe_tqdm(files, desc="移动文件"):
         try:
             relative_path = src_path.relative_to(source_dir)
             dest_path = target_dir / relative_path
@@ -444,13 +462,13 @@ def move_files_preserving_structure(
                 success_count += 1
 
         except Exception as e:
-            print(f"移动文件失败 {src_path}: {e}")
+            safe_print(f"移动文件失败 {src_path}: {e}")
             failed_count += 1
 
-    print(f"\n移动完成！成功移动 {success_count} 个文件")
+    safe_print(f"\n移动完成！成功移动 {success_count} 个文件")
     if failed_count > 0:
-        print(f"失败 {failed_count} 个文件")
-    print(f"文件已移动到: {target_dir}")
+        safe_print(f"失败 {failed_count} 个文件")
+    safe_print(f"文件已移动到: {target_dir}")
 
 
 def generate_report(
@@ -506,8 +524,8 @@ def generate_report(
                 relative_path = file_path.relative_to(source_dir)
                 f.write(f"[未知] {relative_path}\n")
 
-    print(f"\n筛选报告已保存到: {report_path}")
-    print(f"报告包含 {len(all_files_info)} 个文件的详细信息")
+    safe_print(f"\n筛选报告已保存到: {report_path}")
+    safe_print(f"报告包含 {len(all_files_info)} 个文件的详细信息")
 
 
 def main():
@@ -556,59 +574,59 @@ def main():
     target_dir = Path(args.target).resolve() if args.target else None
 
     if not source_dir.exists():
-        print(f"错误: 源目录不存在: {source_dir}")
+        safe_print(f"错误: 源目录不存在: {source_dir}")
         return
 
     if target_dir and source_dir == target_dir:
-        print("错误: 源目录和目标目录不能相同")
+        safe_print("错误: 源目录和目标目录不能相同")
         return
 
     move_excluded_dir = None
     if args.move_excluded:
         move_excluded_dir = Path(args.move_excluded).resolve()
         if move_excluded_dir == source_dir:
-            print("错误: 排除文件的移动目标目录不能与源目录相同")
+            safe_print("错误: 排除文件的移动目标目录不能与源目录相同")
             return
         if target_dir and move_excluded_dir == target_dir:
-            print("错误: 排除文件的移动目标目录不能与 PA 文件目标目录相同")
+            safe_print("错误: 排除文件的移动目标目录不能与 PA 文件目标目录相同")
             return
 
     if not target_dir and not move_excluded_dir and not args.report:
-        print("提示: 未指定任何输出操作（-t 或 --move-excluded 或 --report）")
-        print("      程序将仅进行扫描和统计")
+        safe_print("提示: 未指定任何输出操作（-t 或 --move-excluded 或 --report）")
+        safe_print("      程序将仅进行扫描和统计")
 
-    print("=" * 60)
-    print("DICOM 胸部 X 光片 PA 位筛选工具（支持中文识别）")
-    print("=" * 60)
-    print(f"源目录: {source_dir}")
+    safe_print("=" * 60)
+    safe_print("DICOM 胸部 X 光片 PA 位筛选工具（支持中文识别）")
+    safe_print("=" * 60)
+    safe_print(f"源目录: {source_dir}")
     if target_dir:
-        print(f"PA 文件目标目录: {target_dir}")
+        safe_print(f"PA 文件目标目录: {target_dir}")
     else:
-        print("PA 文件目标目录: (未指定，跳过复制)")
+        safe_print("PA 文件目标目录: (未指定，跳过复制)")
 
     if move_excluded_dir:
-        print(f"非 PA 文件移动目录: {move_excluded_dir}")
-    print("-" * 60)
+        safe_print(f"非 PA 文件移动目录: {move_excluded_dir}")
+    safe_print("-" * 60)
 
-    print("正在扫描 DICOM 文件...")
+    safe_print("正在扫描 DICOM 文件...")
     dicom_files = scan_dicom_files(source_dir)
 
     if not dicom_files:
-        print("未找到任何 DICOM 文件")
+        safe_print("未找到任何 DICOM 文件")
         return
 
-    print(f"找到 {len(dicom_files)} 个 DICOM 文件")
+    safe_print(f"找到 {len(dicom_files)} 个 DICOM 文件")
 
     pa_files, all_files_info = filter_pa_views(dicom_files)
     pa_set = set(pa_files)
     excluded_files = [f for f, _ in all_files_info if f not in pa_set]
 
-    print("\n" + "=" * 60)
-    print("筛选结果统计")
-    print(f"总文件数: {len(all_files_info)}")
-    print(f"PA 位文件数: {len(pa_files)}")
-    print(f"其他体位文件数: {len(excluded_files)}")
-    print("=" * 60)
+    safe_print("\n" + "=" * 60)
+    safe_print("筛选结果统计")
+    safe_print(f"总文件数: {len(all_files_info)}")
+    safe_print(f"PA 位文件数: {len(pa_files)}")
+    safe_print(f"其他体位文件数: {len(excluded_files)}")
+    safe_print("=" * 60)
 
     from collections import Counter
 
@@ -617,15 +635,15 @@ def main():
         if view_pos:
             view_counts[view_pos] += 1
 
-    print("\n拍摄体位分布:")
-    print("-" * 40)
+    safe_print("\n拍摄体位分布:")
+    safe_print("-" * 40)
     for view_pos, count in view_counts.most_common(20):
         percentage = (count / len(all_files_info)) * 100
         status = "PA" if is_pa_view(view_pos) else "排除"
-        print(f"{status:<4} {view_pos:<25} : {count:>4} 个({percentage:>5.1f}%)")
+        safe_print(f"{status:<4} {view_pos:<25} : {count:>4} 个({percentage:>5.1f}%)")
 
     if len(view_counts) > 20:
-        print(f"... 还有 {len(view_counts) - 20} 种其他体位")
+        safe_print(f"... 还有 {len(view_counts) - 20} 种其他体位")
 
     if args.report:
         report_dir = target_dir if target_dir else (move_excluded_dir if move_excluded_dir else source_dir)
@@ -635,32 +653,32 @@ def main():
 
     if not args.dry_run:
         if target_dir and pa_files:
-            print(f"\n发现 {len(pa_files)} 个 PA 位文件")
-            print("\n前 5 个将要复制的文件:")
+            safe_print(f"\n发现 {len(pa_files)} 个 PA 位文件")
+            safe_print("\n前 5 个将要复制的文件:")
             for i, file_path in enumerate(pa_files[:5], 1):
-                print(f"{i}. {file_path.relative_to(source_dir)}")
+                safe_print(f"{i}. {file_path.relative_to(source_dir)}")
 
             if len(pa_files) > 5:
-                print(f"... 还有 {len(pa_files) - 5} 个文件")
+                safe_print(f"... 还有 {len(pa_files) - 5} 个文件")
 
             response = input("是否开始复制 PA 文件? [Y/n]: ")
             if response.lower() != "n":
                 copy_pa_files(pa_files, source_dir, target_dir)
             else:
-                print("PA 文件复制操作已取消")
+                safe_print("PA 文件复制操作已取消")
         elif target_dir:
-            print("\n未找到符合条件的 PA 位文件")
+            safe_print("\n未找到符合条件的 PA 位文件")
             if not args.debug:
-                print("提示: 可使用 --debug 参数查看详细的识别过程")
+                safe_print("提示: 可使用 --debug 参数查看详细的识别过程")
 
         if move_excluded_dir and excluded_files:
-            print(f"\n发现 {len(excluded_files)} 个非 PA 位文件")
-            print("\n前 5 个将要移动的文件:")
+            safe_print(f"\n发现 {len(excluded_files)} 个非 PA 位文件")
+            safe_print("\n前 5 个将要移动的文件:")
             for i, file_path in enumerate(excluded_files[:5], 1):
-                print(f"{i}. {file_path.relative_to(source_dir)}")
+                safe_print(f"{i}. {file_path.relative_to(source_dir)}")
 
             if len(excluded_files) > 5:
-                print(f"... 还有 {len(excluded_files) - 5} 个文件")
+                safe_print(f"... 还有 {len(excluded_files) - 5} 个文件")
 
             response = input(
                 f"是否开始移动非 PA 文件到 {move_excluded_dir}? [Y/n]: "
@@ -668,12 +686,12 @@ def main():
             if response.lower() != "n":
                 move_files_preserving_structure(excluded_files, source_dir, move_excluded_dir)
             else:
-                print("非 PA 文件移动操作已取消")
+                safe_print("非 PA 文件移动操作已取消")
         elif move_excluded_dir:
-            print("\n未找到非 PA 位文件，无需移动")
+            safe_print("\n未找到非 PA 位文件，无需移动")
     else:
-        print("\n【dry-run 模式】未执行文件复制/移动操作")
-        print("提示: 去掉 --dry-run 参数即可执行实际操作")
+        safe_print("\n【dry-run 模式】未执行文件复制/移动操作")
+        safe_print("提示: 去掉 --dry-run 参数即可执行实际操作")
 
 
 if __name__ == "__main__":
