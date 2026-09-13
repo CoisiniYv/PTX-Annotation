@@ -1,1 +1,0 @@
-pyinstaller --noconfirm --windowed --onefile --upx-dir E:\upx --icon icon1.ico app.py
