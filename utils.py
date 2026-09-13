@@ -198,9 +198,7 @@ def _safe_sitk_read_image(path: str):
         if not os.path.exists(path):
             raise FileNotFoundError(f"文件不存在: {path}") from e
 
-        # 只有路径含非 ASCII 时才走兜底复制
-        if not _has_non_ascii(path):
-            raise
+        # 兜底：文件存在但首次读取失败时，复制到临时英文路径再读
 
         temp_dir = tempfile.mkdtemp(prefix="sitk_ascii_")
         src = Path(path)
