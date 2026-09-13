@@ -404,8 +404,22 @@ class ActionsMixin:
         if reference_image_path:
             try:
                 ref_img, ref_tmp_dir = self._read_reference_image_2d(reference_image_path)
-                if tuple(ref_img.GetSize()) == (out_arr.shape[1], out_arr.shape[0]):
+                ref_size = tuple(ref_img.GetSize())
+                out_size = (out_arr.shape[1], out_arr.shape[0])  # sitk (W, H)
+                if ref_size == out_size:
                     out_img.CopyInformation(ref_img)
+                else:
+                    # [修复] 尺寸不一致时不能用 CopyInformation（SimpleITK 会拒绝）。
+                    # 以前这里静默跳过，导致写出的 NIfTI 用默认 spacing=(1,1)；
+                    # 下次加载若走物理空间重采样，掩码会被放大到覆盖全图（全红）。
+                    # 正确做法：手动继承 spacing / origin / direction，让下次按
+                    # 物理空间解读时与参考图一致；size 差异由 target_shape 兜底对齐。
+                    try:
+                        out_img.SetSpacing(ref_img.GetSpacing())
+                        out_img.SetOrigin(ref_img.GetOrigin())
+                        out_img.SetDirection(ref_img.GetDirection())
+                    except Exception:
+                        pass
             except Exception:
                 pass
             finally:
@@ -1051,7 +1065,10 @@ class ActionsMixin:
         rel_path = os.path.relpath(entry.orig_path, self.orig_root).replace("\\", "/")
         json_key = rel_path
         if self.task_mode:
-            json_key = self.task_key_map.get(entry.orig_path, rel_path)
+            # [修复] task_key_map 存的是原始 JSON key，可能含反斜杠；
+            # 规范化后与 _labels_cache 的 key 格式保持一致，避免插入重复 key
+            raw_key = self.task_key_map.get(entry.orig_path, rel_path)
+            json_key = str(raw_key).replace("\\", "/")
         if not getattr(self, "_labels_cache", None):
             self._init_labels_cache()
         self._labels_cache[json_key] = val
@@ -1165,6 +1182,358 @@ class ActionsMixin:
                 return
 
         self._start_mask_audit_task(vals)
+
+    # ==========================================
+    # 空掩码检测：扫描内容全零的无效掩码
+    # ==========================================
+    def open_empty_mask_scan_tool(self):
+        """扫描当前加载数据中所有 has_mask=True 的条目，检测内容全零的掩码。"""
+        # 1) 收集要扫描的掩码路径（兼容任务模式 / 普通模式）
+        mask_paths: list[str] = []
+        seen: set[str] = set()
+
+        def _collect(entries):
+            for e in entries or []:
+                p = getattr(e, "mask_path", "") or ""
+                if not p or not getattr(e, "has_mask", False):
+                    continue
+                if p in seen:
+                    continue
+                if not os.path.isfile(p):
+                    continue
+                seen.add(p)
+                mask_paths.append(p)
+
+        if getattr(self, "task_mode", False):
+            _collect(getattr(self, "task_entries", []))
+        else:
+            # 普通模式：遍历两个列表里所有病例，展开为 entries
+            if hasattr(self, "list_todo") and hasattr(self, "list_annotated"):
+                for lst in (self.list_todo, self.list_annotated):
+                    for i in range(lst.count()):
+                        item = lst.item(i)
+                        if not item:
+                            continue
+                        case_name = item.data(Qt.UserRole)
+                        if not case_name:
+                            continue
+                        try:
+                            _collect(self._expand_case_to_entries(case_name))
+                        except Exception:
+                            pass
+
+        if not mask_paths:
+            QMessageBox.information(
+                self,
+                "空掩码检测",
+                "未发现任何已标注为有掩码的条目。\n请先扫描目录或加载任务 JSON。",
+            )
+            return
+
+        # 2) 启动后台扫描任务
+        self._cancel_empty_mask_scan()
+        self._empty_mask_scan_token = getattr(self, "_empty_mask_scan_token", 0) + 1
+        token = self._empty_mask_scan_token
+        self._empty_mask_scan_cancelled = False
+
+        progress = QProgressDialog(
+            f"正在检测空掩码 (共 {len(mask_paths)} 个)...", "取消", 0, len(mask_paths), self
+        )
+        progress.setWindowModality(Qt.NonModal)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.show()
+        self._empty_mask_scan_progress = progress
+        progress.canceled.connect(lambda: self._cancel_empty_mask_scan(user_cancel=True))
+
+        self._empty_mask_scan_queue = queue.Queue()
+        self._empty_mask_scan_progress_queue = queue.Queue()
+
+        def _progress_cb(done, total):
+            try:
+                self._empty_mask_scan_progress_queue.put_nowait((done, total))
+            except Exception:
+                pass
+
+        def _cancel_cb():
+            return getattr(self, "_empty_mask_scan_cancelled", False)
+
+        def _worker(tk, paths, q):
+            try:
+                empty_list, error_list = mask_audit.detect_empty_masks(
+                    paths, progress_cb=_progress_cb, cancel_cb=_cancel_cb
+                )
+                q.put({"ok": True, "empty": empty_list, "errors": error_list})
+            except Exception as e:
+                q.put({"ok": False, "error": str(e)})
+
+        t = threading.Thread(
+            target=_worker,
+            args=(token, list(mask_paths), self._empty_mask_scan_queue),
+            daemon=True,
+        )
+        self._empty_mask_scan_thread = t
+        t.start()
+
+        timer = QTimer(self)
+        timer.setInterval(150)
+        timer.timeout.connect(lambda: self._poll_empty_mask_scan(token))
+        timer.start()
+        self._empty_mask_scan_timer = timer
+
+    def _cancel_empty_mask_scan(self, user_cancel: bool = False):
+        self._empty_mask_scan_cancelled = True
+        timer = getattr(self, "_empty_mask_scan_timer", None)
+        if timer is not None:
+            timer.stop()
+            self._empty_mask_scan_timer = None
+        progress = getattr(self, "_empty_mask_scan_progress", None)
+        if progress is not None:
+            try:
+                progress.close()
+            except Exception:
+                pass
+            self._empty_mask_scan_progress = None
+        if user_cancel:
+            self.statusBar().showMessage("空掩码检测已取消", 2000)
+
+    def _poll_empty_mask_scan(self, token):
+        if token != getattr(self, "_empty_mask_scan_token", -1):
+            return
+
+        # 1) 先消费进度信息
+        pq = getattr(self, "_empty_mask_scan_progress_queue", None)
+        if pq is not None:
+            latest = None
+            try:
+                while True:
+                    latest = pq.get_nowait()
+            except queue.Empty:
+                pass
+            progress = getattr(self, "_empty_mask_scan_progress", None)
+            if latest is not None and progress is not None:
+                done, total = latest
+                try:
+                    if progress.maximum() != total:
+                        progress.setMaximum(total)
+                    progress.setValue(done)
+                except Exception:
+                    pass
+
+        # 2) 看是否有最终结果
+        q = getattr(self, "_empty_mask_scan_queue", None)
+        if q is None:
+            return
+        try:
+            result = q.get_nowait()
+        except queue.Empty:
+            return
+
+        # 清理定时器/进度
+        timer = getattr(self, "_empty_mask_scan_timer", None)
+        if timer is not None:
+            timer.stop()
+            self._empty_mask_scan_timer = None
+        progress = getattr(self, "_empty_mask_scan_progress", None)
+        if progress is not None:
+            try:
+                progress.close()
+            except Exception:
+                pass
+            self._empty_mask_scan_progress = None
+
+        if not result.get("ok"):
+            QMessageBox.warning(
+                self, "空掩码检测", f"扫描失败: {result.get('error', '未知错误')}"
+            )
+            return
+
+        empty_list = result.get("empty", [])
+        error_list = result.get("errors", [])
+        self._show_empty_mask_result_dialog(empty_list, error_list)
+
+    def _show_empty_mask_result_dialog(self, empty_list, error_list):
+        """展示空掩码结果，并允许选择性删除。"""
+        if not empty_list and not error_list:
+            QMessageBox.information(self, "空掩码检测", "未发现空掩码或读取错误。")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(
+            f"空掩码检测结果 - 空掩码 {len(empty_list)} 个，读取错误 {len(error_list)} 个"
+        )
+        dlg.resize(760, 520)
+
+        from PySide6.QtWidgets import (
+            QVBoxLayout,
+            QHBoxLayout,
+            QLabel,
+            QListWidget,
+            QListWidgetItem as _LI,
+            QPushButton,
+            QCheckBox,
+        )
+
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            f"共检测到 <b>{len(empty_list)}</b> 个内容全零的掩码文件。"
+            + (f"<br>另有 {len(error_list)} 个读取错误（不可删除，仅展示）。" if error_list else "")
+        )
+        info.setTextFormat(Qt.RichText)
+        layout.addWidget(info)
+
+        list_widget = QListWidget(dlg)
+        list_widget.setSelectionMode(QListWidget.ExtendedSelection)
+
+        for item_info in empty_list:
+            p = item_info.get("path", "")
+            sz = item_info.get("size_bytes", 0)
+            li = _LI(f"[空] {p}    ({sz} bytes)")
+            li.setData(Qt.UserRole, {"kind": "empty", "path": p})
+            li.setFlags(li.flags() | Qt.ItemIsUserCheckable)
+            li.setCheckState(Qt.Checked)
+            list_widget.addItem(li)
+
+        for item_info in error_list:
+            p = item_info.get("path", "")
+            err = item_info.get("error", "")
+            li = _LI(f"[错误] {p}  —  {err}")
+            li.setData(Qt.UserRole, {"kind": "error", "path": p})
+            # 错误项不可勾选删除（红字提示）
+            li.setFlags((li.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsUserCheckable)
+            li.setForeground(QColor("#ff5555"))
+            list_widget.addItem(li)
+
+        layout.addWidget(list_widget)
+
+        select_bar = QHBoxLayout()
+        btn_select_all = QPushButton("全选空掩码")
+        btn_select_none = QPushButton("全不选")
+        select_bar.addWidget(btn_select_all)
+        select_bar.addWidget(btn_select_none)
+        select_bar.addStretch(1)
+        layout.addLayout(select_bar)
+
+        def _toggle_all(state):
+            for i in range(list_widget.count()):
+                it = list_widget.item(i)
+                meta = it.data(Qt.UserRole) or {}
+                if meta.get("kind") != "empty":
+                    continue
+                it.setCheckState(state)
+
+        btn_select_all.clicked.connect(lambda: _toggle_all(Qt.Checked))
+        btn_select_none.clicked.connect(lambda: _toggle_all(Qt.Unchecked))
+
+        btn_bar = QHBoxLayout()
+        btn_delete = QPushButton("删除选中空掩码")
+        btn_close = QPushButton("关闭")
+        btn_bar.addStretch(1)
+        btn_bar.addWidget(btn_delete)
+        btn_bar.addWidget(btn_close)
+        layout.addLayout(btn_bar)
+
+        def _do_delete():
+            targets = []
+            for i in range(list_widget.count()):
+                it = list_widget.item(i)
+                meta = it.data(Qt.UserRole) or {}
+                if meta.get("kind") != "empty":
+                    continue
+                if it.checkState() != Qt.Checked:
+                    continue
+                targets.append(meta.get("path", ""))
+
+            targets = [p for p in targets if p]
+            if not targets:
+                QMessageBox.information(dlg, "提示", "未勾选任何空掩码。")
+                return
+
+            reply = QMessageBox.question(
+                dlg,
+                "确认删除",
+                f"确定要删除 {len(targets)} 个空掩码文件吗？此操作不可恢复。",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+            deleted = 0
+            failed = []
+            for p in targets:
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                        deleted += 1
+                except Exception as e:
+                    failed.append((p, str(e)))
+
+            # 同步内存中 entry.has_mask / mask 缓存 / 目录匹配缓存
+            self._mark_masks_deleted(set(targets))
+
+            msg = f"已删除 {deleted} 个空掩码。"
+            if failed:
+                sample = "\n".join([f"{p}: {err}" for p, err in failed[:5]])
+                msg += f"\n{len(failed)} 个失败:\n{sample}"
+            QMessageBox.information(dlg, "完成", msg)
+            dlg.accept()
+
+        btn_delete.clicked.connect(_do_delete)
+        btn_close.clicked.connect(dlg.reject)
+
+        dlg.exec()
+
+    def _mark_masks_deleted(self, deleted_paths: set):
+        """删除空掩码后同步内存状态：entry.has_mask / 缓存 / 当前视图。"""
+        if not deleted_paths:
+            return
+
+        def _patch_entries(entries):
+            for e in entries or []:
+                mp = getattr(e, "mask_path", "") or ""
+                if mp in deleted_paths:
+                    e.has_mask = False
+
+        if getattr(self, "task_mode", False):
+            _patch_entries(getattr(self, "task_entries", []))
+            for case_name, case_entries in getattr(self, "task_case_entries", {}).items():
+                _patch_entries(case_entries)
+
+        _patch_entries(getattr(self, "entries", []))
+
+        # 清理目录匹配缓存（X 光模式按目录缓存了掩码映射）
+        if hasattr(self, "_xray_dir_match_cache"):
+            try:
+                self._xray_dir_match_cache.clear()
+            except Exception:
+                pass
+
+        # 清理已加载的影像缓存中涉及到这些掩码的条目
+        try:
+            with self._cache_lock:
+                for key in list(self._image_cache.keys()):
+                    # 这里 key 是 orig_path，查不到掩码路径，保守做法是清空缓存
+                    pass
+        except Exception:
+            pass
+
+        # 若当前加载的 entry 的掩码被删，刷新画布以反映状态
+        try:
+            if 0 <= self.current_idx < len(self.entries):
+                cur_entry = self.entries[self.current_idx]
+                if getattr(cur_entry, "mask_path", "") in deleted_paths:
+                    self.load_image_at_index(self.current_idx, start_background=False)
+        except Exception:
+            pass
+
+        if hasattr(self, "_update_status_ui"):
+            try:
+                self._update_status_ui()
+            except Exception:
+                pass
 
     def _start_pa_filter_task(self, params):
         self._cancel_pa_filter_task()

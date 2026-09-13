@@ -130,12 +130,28 @@ class VisualControlWidget(QWidget):
         l_filter.setSpacing(2)
         
         self.combo_filter = QComboBox()
-        self.combo_filter.addItems(["正常", "CLAHE", "锐化", "平滑"])
-        self.combo_filter.setFixedWidth(65)
+        self.combo_filter.addItems(["正常", "增强", "锐化", "平滑"])
+        self.combo_filter.setFixedWidth(50)
         self.combo_filter.setToolTip("医学影像增强滤镜")
         self.combo_filter.currentIndexChanged.connect(
             lambda i: self.valueChanged.emit("filter", float(i))
         )
+
+        # 关键：隐藏下拉箭头，缩掉右侧区域
+        self.combo_filter.setStyleSheet("""
+            QComboBox::drop-down {
+                width: 0px;
+                border: none;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                width: 0px;
+                height: 0px;
+            }
+            QComboBox {
+                padding-right: 0px;
+            }
+        """)
         
         self.slider_filter_strength = QSlider(Qt.Horizontal)
         self.slider_filter_strength.setRange(0, 100)

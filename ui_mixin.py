@@ -6,6 +6,7 @@ UI结构说明：
    - 已标注病例列表 (list_annotated)
    - 待标注病例列表 (list_todo)
    - 点击病例名称触发 load_case_sequence 加载
+   - 新增病例搜索框：支持 Ctrl+F 聚焦，支持中英文/Windows 路径模糊搜索
 
 2. 中央工作区：
    - 画布 (canvas)：显示图片和掩码，支持标注操作
@@ -26,15 +27,19 @@ UI结构说明：
    - 窗口菜单：显示/隐藏各个面板、性能设置
 """
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMessageBox,
+    QMenu,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -45,6 +50,7 @@ from PySide6.QtWidgets import (
 
 from icons import IconFactory
 from models import ScanMode, ToolType
+from tools.case_search import CaseSearchEngine, build_case_search_candidates
 from widgets import DicomInfoPanel, VisualControlWidget
 
 
@@ -56,9 +62,47 @@ class UiMixin:
         self.files_widget = QWidget()
         files_layout = QVBoxLayout(self.files_widget)
         files_layout.setContentsMargins(5, 5, 5, 5)
+        files_layout.setSpacing(6)
+
+        self.case_search_text = ""
+        self._case_search_refresh_timer = QTimer(self)
+        self._case_search_refresh_timer.setSingleShot(True)
+        self._case_search_refresh_timer.timeout.connect(self._apply_case_filter_now)
+
+        search_row = QWidget()
+        search_layout = QHBoxLayout(search_row)
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        search_layout.setSpacing(6)
+
+        self.lbl_case_search = QLabel("病例搜索")
+        self.edit_case_search = QLineEdit()
+        self.edit_case_search.setObjectName("CaseSearchEdit")
+        self.edit_case_search.setPlaceholderText("Ctrl+F 搜索病例名 / 路径（支持模糊匹配）")
+        self.edit_case_search.setClearButtonEnabled(True)
+        self.edit_case_search.textChanged.connect(self._on_case_search_text_changed)
+        self.edit_case_search.returnPressed.connect(self.activate_first_visible_case)
+
+        self.lbl_case_search_hits = QLabel("")
+        self.lbl_case_search_hits.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_case_search_hits.setMinimumWidth(72)
+
+        search_layout.addWidget(self.lbl_case_search)
+        search_layout.addWidget(self.edit_case_search, 1)
+        search_layout.addWidget(self.lbl_case_search_hits)
+        files_layout.addWidget(search_row)
 
         self.list_annotated = QListWidget()
         self.list_todo = QListWidget()
+        self.list_annotated.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_todo.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_annotated.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_todo.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_annotated.customContextMenuRequested.connect(
+            lambda pos: self._show_case_list_context_menu(self.list_annotated, pos)
+        )
+        self.list_todo.customContextMenuRequested.connect(
+            lambda pos: self._show_case_list_context_menu(self.list_todo, pos)
+        )
 
         def create_group(title, widget):
             grp = QGroupBox(title)
@@ -67,13 +111,16 @@ class UiMixin:
             l.addWidget(widget)
             return grp
 
-        files_layout.addWidget(
-            create_group("已标注病例 (Completed)", self.list_annotated)
-        )
-        files_layout.addWidget(create_group("待标注病例 (Todo)", self.list_todo))
+        self.grp_annotated = create_group("已标注病例 (Completed)", self.list_annotated)
+        self.grp_todo = create_group("待标注病例 (Todo)", self.list_todo)
+        files_layout.addWidget(self.grp_annotated)
+        files_layout.addWidget(self.grp_todo)
 
         self.list_annotated.itemClicked.connect(self.load_case_sequence)
         self.list_todo.itemClicked.connect(self.load_case_sequence)
+
+        self._bind_case_list_search_hooks(self.list_annotated)
+        self._bind_case_list_search_hooks(self.list_todo)
 
         main_splitter.addWidget(self.files_widget)
 
@@ -131,6 +178,179 @@ class UiMixin:
         main_splitter.addWidget(center_right_splitter)
         main_splitter.setStretchFactor(0, 2)
         main_splitter.setStretchFactor(1, 8)
+
+    # =========================
+    # 病例搜索
+    # =========================
+    def _bind_case_list_search_hooks(self, lst: QListWidget) -> None:
+        model = lst.model()
+        if model is None:
+            return
+
+        model.rowsInserted.connect(lambda *args: self._schedule_case_search_refresh())
+        model.rowsRemoved.connect(lambda *args: self._schedule_case_search_refresh())
+        model.modelReset.connect(lambda *args: self._schedule_case_search_refresh())
+        model.layoutChanged.connect(lambda *args: self._schedule_case_search_refresh())
+        model.dataChanged.connect(lambda *args: self._schedule_case_search_refresh())
+
+    def _schedule_case_search_refresh(self, delay_ms: int = 80) -> None:
+        timer = getattr(self, "_case_search_refresh_timer", None)
+        if timer is not None:
+            timer.start(max(0, int(delay_ms)))
+
+    def _iter_case_items(self, lst: QListWidget):
+        for i in range(lst.count()):
+            yield lst.item(i)
+
+    def _visible_item_count(self, lst: QListWidget) -> int:
+        return sum(1 for item in self._iter_case_items(lst) if not item.isHidden())
+
+    def _build_case_item_search_candidates(self, item) -> list[str]:
+        case_name = item.data(Qt.UserRole)
+        # 数字搜索尽量避免被 statusTip / whatsThis 这类噪声字段污染，
+        # 重点使用“用户看得到的名称”和“真实病例标识/路径”。
+        return build_case_search_candidates(
+            item.text(),
+            case_name,
+            item.toolTip(),
+        )
+
+    def _filter_case_list_widget(self, lst: QListWidget, engine: CaseSearchEngine) -> int:
+        visible_count = 0
+        for item in self._iter_case_items(lst):
+            result = engine.match(self._build_case_item_search_candidates(item))
+            matched = result.matched
+            item.setHidden(not matched)
+            if not matched and item.isSelected():
+                item.setSelected(False)
+            if matched:
+                visible_count += 1
+        return visible_count
+
+    def _update_case_search_hit_label(
+        self,
+        visible_done: int,
+        visible_pending: int,
+        total_done: int,
+        total_pending: int,
+    ) -> None:
+        visible_total = visible_done + visible_pending
+        total = total_done + total_pending
+        query = getattr(self, "case_search_text", "").strip()
+        if query:
+            self.lbl_case_search_hits.setText(f"{visible_total}/{total}")
+            self.lbl_case_search_hits.setToolTip(
+                f"当前搜索命中 {visible_total} 个病例（已标注 {visible_done}，待标注 {visible_pending}）"
+            )
+        else:
+            self.lbl_case_search_hits.setText("")
+            self.lbl_case_search_hits.setToolTip("")
+
+    def _apply_case_filter_now(self) -> None:
+        query = getattr(self, "case_search_text", "")
+        engine = CaseSearchEngine(query)
+
+        total_done = self.list_annotated.count()
+        total_pending = self.list_todo.count()
+        visible_done = self._filter_case_list_widget(self.list_annotated, engine)
+        visible_pending = self._filter_case_list_widget(self.list_todo, engine)
+
+        self.update_case_list_headers(
+            total_cases=total_done + total_pending,
+            done_cases=total_done,
+            pending_cases=total_pending,
+            filtered_done_cases=visible_done,
+            filtered_pending_cases=visible_pending,
+        )
+        self._update_case_search_hit_label(
+            visible_done, visible_pending, total_done, total_pending
+        )
+
+    def _on_case_search_text_changed(self, text):
+        self.case_search_text = "" if text is None else str(text)
+        self._schedule_case_search_refresh(60)
+
+    def apply_case_filter(self, text: str | None = None) -> None:
+        if text is not None:
+            text = str(text)
+            if hasattr(self, "edit_case_search") and self.edit_case_search.text() != text:
+                prev = self.edit_case_search.blockSignals(True)
+                self.edit_case_search.setText(text)
+                self.edit_case_search.blockSignals(prev)
+            self.case_search_text = text
+        else:
+            self.case_search_text = self.edit_case_search.text() if hasattr(self, "edit_case_search") else ""
+
+        self._apply_case_filter_now()
+
+    def focus_case_search(self):
+        if hasattr(self, "edit_case_search"):
+            self.edit_case_search.setFocus(Qt.ShortcutFocusReason)
+            self.edit_case_search.selectAll()
+
+    def clear_case_search(self):
+        if hasattr(self, "edit_case_search"):
+            self.edit_case_search.clear()
+        else:
+            self.case_search_text = ""
+            self._apply_case_filter_now()
+
+    def activate_first_visible_case(self):
+        for lst in (self.list_todo, self.list_annotated):
+            for item in self._iter_case_items(lst):
+                if item.isHidden():
+                    continue
+                lst.setFocus(Qt.OtherFocusReason)
+                lst.setCurrentItem(item)
+                self.load_case_sequence(item)
+                return
+
+    def update_case_list_headers(
+        self,
+        total_cases: int | None = None,
+        done_cases: int | None = None,
+        pending_cases: int | None = None,
+        filtered_done_cases: int | None = None,
+        filtered_pending_cases: int | None = None,
+    ) -> None:
+        if total_cases is None or done_cases is None or pending_cases is None:
+            done = self.list_annotated.count()
+            pending = self.list_todo.count()
+            total = done + pending
+        else:
+            done, pending, total = done_cases, pending_cases, total_cases
+
+        visible_done = (
+            filtered_done_cases
+            if filtered_done_cases is not None
+            else self._visible_item_count(self.list_annotated)
+        )
+        visible_pending = (
+            filtered_pending_cases
+            if filtered_pending_cases is not None
+            else self._visible_item_count(self.list_todo)
+        )
+        search_active = bool(getattr(self, "case_search_text", "").strip())
+
+        if hasattr(self, "grp_annotated"):
+            if search_active:
+                self.grp_annotated.setTitle(
+                    f"已标注病例 (Completed: {visible_done}/{done})"
+                )
+            elif getattr(self, "task_mode", False) and total > 0:
+                self.grp_annotated.setTitle(f"已标注病例 (Completed: {done}/{total})")
+            else:
+                self.grp_annotated.setTitle("已标注病例 (Completed)")
+
+        if hasattr(self, "grp_todo"):
+            if search_active:
+                self.grp_todo.setTitle(
+                    f"待标注病例 (Todo: {visible_pending}/{pending})"
+                )
+            elif getattr(self, "task_mode", False) and total > 0:
+                self.grp_todo.setTitle(f"待标注病例 (Todo: {pending}/{total})")
+            else:
+                self.grp_todo.setTitle("待标注病例 (Todo)")
 
     def _init_toolbar(self):
         tb = QToolBar("主控制台")
@@ -225,6 +445,7 @@ class UiMixin:
         QShortcut(QKeySequence("Ctrl+S"), self, self.save_mask)
         QShortcut(QKeySequence("Ctrl+Z"), self, self.canvas.undo)
         QShortcut(QKeySequence("Ctrl+Y"), self, self.canvas.redo)
+        QShortcut(QKeySequence("Ctrl+F"), self, self.focus_case_search)
         QShortcut(QKeySequence("A"), self, self.prev_image)
         QShortcut(QKeySequence("D"), self, self.next_image)
         QShortcut(QKeySequence("W"), self, self.prev_case)
@@ -232,6 +453,9 @@ class UiMixin:
 
         sc_toggle = QShortcut(QKeySequence("Z"), self)
         sc_toggle.activated.connect(self.action_toggle_case_status)
+
+        # F2：重命名当前选中病例（单选），后续由 rename_selected_case 协调数据层
+        QShortcut(QKeySequence("F2"), self, self.rename_selected_case)
 
         QShortcut(QKeySequence("T"), self, lambda: self._update_pneumo_label(1))
         QShortcut(QKeySequence("F"), self, lambda: self._update_pneumo_label(0))
@@ -267,50 +491,144 @@ class UiMixin:
         act_help.triggered.connect(self._show_load_help)
         menu.addAction(act_help)
 
-    def _init_tools_menu(self):
-        menu = self.menuBar().addMenu("整理操作")
+    def _get_active_case_list(self):
+        if self.list_todo.hasFocus():
+            return self.list_todo
+        if self.list_annotated.hasFocus():
+            return self.list_annotated
+        if self.list_todo.currentItem() and not self.list_todo.currentItem().isHidden():
+            return self.list_todo
+        if self.list_annotated.currentItem() and not self.list_annotated.currentItem().isHidden():
+            return self.list_annotated
+        for lst in (self.list_todo, self.list_annotated):
+            for item in self._iter_case_items(lst):
+                if item.isSelected() and not item.isHidden():
+                    return lst
+        return None
 
-        act_pa = QAction("PA 筛选", self)
-        act_pa.triggered.connect(self.open_pa_filter_tool)
-        menu.addAction(act_pa)
+    def rename_selected_case(self):
+        lst = self._get_active_case_list()
+        if lst is None:
+            self.statusBar().showMessage("未选中任何病例", 1000)
+            return
 
-        act_mask_audit = QAction("掩码/JSON 审计", self)
-        act_mask_audit.triggered.connect(self.open_mask_audit_tool)
-        menu.addAction(act_mask_audit)
+        selected_items = [it for it in lst.selectedItems() if not it.isHidden()]
+        if not selected_items:
+            cur = lst.currentItem()
+            if not cur or cur.isHidden():
+                self.statusBar().showMessage("未选中任何病例", 1000)
+                return
+            selected_items = [cur]
 
-    def _show_load_help(self):
-        text = """数据加载方式说明
-一、CT 序列模式（默认）
-1) 原图目录 + 掩码目录 + 扫描
-   - 扫描规则：原图目录的一级子文件夹 = 1 个病例
-   - 进入病例后：递归加载该病例文件夹内的整套序列
-   - 支持格式：png / jpg / bmp / tif / dcm
-   - 掩码规则：与原图保持相对层级一致，后缀统一为 .png
-   - 界面表现：显示缩略图栏和序列滑块
-   例：
-     原图：D:/CT/images/case_001/0001.dcm
-     掩码：D:/CT/masks/case_001/0001.png
-2) 加载任务 JSON
-   - JSON 的键可以是相对路径或绝对路径
-   - CT 模式下会按路径第一层文件夹自动分组为病例
-   例：D:/CT/task/ct_task.json
-二、X 光单张模式
-1) 原图目录 + 掩码目录 + 扫描
-   - 扫描规则：每个原图文件 = 1 个病例
-   - 为避免把掩码当原图，同名非 PNG 原图存在时，会自动跳过同名 PNG
-   - 界面表现：不显示缩略图栏，不启用序列滑块
-   例：
-     原图：D:/XRAY/images/0001.dcm
-     掩码：D:/XRAY/masks/0001.png
-2) 加载单对
-   - 适合直接打开 1 张原图 + 1 张对应掩码
-3) 加载任务 JSON
-   - X 光模式下通常按单张路径作为病例键
-   例：D:/XRAY/task/xray_task.json
+        if len(selected_items) != 1:
+            QMessageBox.information(self, "提示", "重命名仅支持单选一个病例。")
+            return
 
-"""
+        item = selected_items[0]
+        case_name = item.data(Qt.UserRole)
+        if not case_name:
+            self.statusBar().showMessage("选中条目没有有效病例标识", 1500)
+            return
 
-        QMessageBox.information(self, "加载方式说明", text)
+        new_name, ok = QInputDialog.getText(
+            self,
+            "重命名病例",
+            "新的病例名称:",
+            text=str(case_name),
+        )
+        if not ok:
+            return
+
+        new_name = str(new_name).strip()
+        if not new_name or new_name == case_name:
+            return
+
+        if hasattr(self, "rename_case"):
+            self.rename_case(case_name, new_name)
+
+        if getattr(self, "task_mode", False):
+            if hasattr(self, "_build_task_case_lists"):
+                self._build_task_case_lists()
+        else:
+            if hasattr(self, "refresh_lists"):
+                self.refresh_lists()
+
+        if hasattr(self, "_refresh_task_progress_ui"):
+            self._refresh_task_progress_ui()
+
+        self._schedule_case_search_refresh(120)
+        self.statusBar().showMessage(f"已重命名: {case_name} -> {new_name}", 2000)
+
+    def delete_selected_cases(self):
+        lst = self._get_active_case_list()
+        if lst is None:
+            self.statusBar().showMessage("未选中任何病例", 1000)
+            return
+
+        selected_items = [it for it in lst.selectedItems() if not it.isHidden()]
+        if not selected_items:
+            cur = lst.currentItem()
+            if not cur or cur.isHidden():
+                self.statusBar().showMessage("未选中任何病例", 1000)
+                return
+            selected_items = [cur]
+
+        case_names = []
+        seen = set()
+        for it in selected_items:
+            case_name = it.data(Qt.UserRole)
+            if not case_name or case_name in seen:
+                continue
+            seen.add(case_name)
+            case_names.append(case_name)
+
+        if not case_names:
+            self.statusBar().showMessage("选中条目没有有效病例标识", 1500)
+            return
+
+        msg = f"确认删除 {len(case_names)} 个病例的任务/状态记录吗？\n不会删除物理文件。"
+        if (
+            QMessageBox.question(self, "确认删除", msg, QMessageBox.Yes | QMessageBox.No)
+            != QMessageBox.Yes
+        ):
+            return
+
+        for case_name in case_names:
+            if hasattr(self, "delete_case"):
+                self.delete_case(case_name, remove_files=False)
+
+        if getattr(self, "task_mode", False):
+            if hasattr(self, "_build_task_case_lists"):
+                self._build_task_case_lists()
+        else:
+            if hasattr(self, "refresh_lists"):
+                self.refresh_lists()
+
+        if hasattr(self, "_refresh_task_progress_ui"):
+            self._refresh_task_progress_ui()
+
+        self._schedule_case_search_refresh(120)
+        self.statusBar().showMessage(f"已删除 {len(case_names)} 个病例记录", 2000)
+
+    def _show_case_list_context_menu(self, lst, pos):
+        item = lst.itemAt(pos)
+        if item and not item.isHidden() and not item.isSelected():
+            lst.clearSelection()
+            item.setSelected(True)
+            lst.setCurrentItem(item)
+
+        menu = QMenu(self)
+        act_rename = menu.addAction("重命名病例")
+        act_delete = menu.addAction("删除病例(仅删任务/状态)")
+
+        action = menu.exec(lst.mapToGlobal(pos))
+        if not action:
+            return
+
+        if action == act_rename:
+            self.rename_selected_case()
+        elif action == act_delete:
+            self.delete_selected_cases()
 
     def _init_file_menu(self):
         menu = self.menuBar().addMenu("文件")
@@ -331,6 +649,10 @@ class UiMixin:
         act_task = QAction("加载任务JSON", self)
         act_task.triggered.connect(self.select_task_json)
         menu_load.addAction(act_task)
+
+        act_exit_task = QAction("退出任务模式", self)
+        act_exit_task.triggered.connect(self.exit_task_mode)
+        menu_load.addAction(act_exit_task)
 
         act_single = QAction("加载单对", self)
         act_single.triggered.connect(self.load_single_pair)
@@ -357,6 +679,38 @@ class UiMixin:
         act_export_task.setToolTip("将当前扫描到的所有影像打包为一个总任务清单")
         act_export_task.triggered.connect(self.export_task_json)
         menu_export.addAction(act_export_task)
+
+        act_export_selected_task = QAction("导出选中病例为任务 JSON", self)
+        act_export_selected_task.setToolTip("仅导出当前列表中被选中的病例为任务清单（支持多选）")
+        act_export_selected_task.triggered.connect(self.export_selected_task_json)
+        menu_export.addAction(act_export_selected_task)
+
+    def _init_tools_menu(self):
+        menu = self.menuBar().addMenu("整理操作")
+
+        act_pa_filter = QAction("PA 筛选工具", self)
+        act_pa_filter.triggered.connect(self.open_pa_filter_tool)
+        menu.addAction(act_pa_filter)
+
+        act_mask_audit = QAction("掩码/JSON 审计工具", self)
+        act_mask_audit.triggered.connect(self.open_mask_audit_tool)
+        menu.addAction(act_mask_audit)
+
+        # [新功能] 空掩码检测：扫描已有掩码文件，找出内容全零的无效掩码
+        act_empty_scan = QAction("空掩码检测", self)
+        act_empty_scan.triggered.connect(self.open_empty_mask_scan_tool)
+        menu.addAction(act_empty_scan)
+
+    def _show_load_help(self):
+        text = (
+            "推荐加载方式：\n"
+            "1. 选择原图目录\n"
+            "2. （可选）选择掩码目录\n"
+            "3. 点击“扫描”构建病例列表\n\n"
+            "任务模式：点击“加载任务JSON”，将按任务键构建病例列表。\n\n"
+            "现在支持 Ctrl+F 搜索当前病例列表，可按病例名、路径、中文目录名进行模糊搜索。"
+        )
+        QMessageBox.information(self, "加载方式说明", text)
 
     def _on_viz_change(self, type_, val):
         if type_ == "invert":
@@ -406,6 +760,9 @@ class UiMixin:
         if hasattr(self, "current_case_name"):
             self.current_case_name = ""
 
+        # 不清空搜索输入，仅保留关键字，等待新列表建立后自动重新过滤。
+        self.case_search_text = self.edit_case_search.text() if hasattr(self, "edit_case_search") else ""
+
         # 清空画布，回到背景状态
         self.canvas.base_img = None
         self.canvas.mask = None
@@ -422,6 +779,15 @@ class UiMixin:
         # 同步 canvas 窗宽窗位状态，防止旧值被新图沿用
         self.canvas.window_center = 0
         self.canvas.window_width = 0
+
+        self.update_case_list_headers(
+            total_cases=0,
+            done_cases=0,
+            pending_cases=0,
+            filtered_done_cases=0,
+            filtered_pending_cases=0,
+        )
+        self._update_case_search_hit_label(0, 0, 0, 0)
 
         mode_name = "CT 序列" if is_ct else "X 光单张"
         self.statusBar().showMessage(

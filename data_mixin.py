@@ -5,6 +5,7 @@ import os
 import queue
 import re
 import threading
+import sqlite3
 
 import cv2
 import numpy as np
@@ -46,6 +47,69 @@ from utils import (
 
 
 class DataMixin:
+    def _get_meta_db_path(self):
+        """返回当前数据根目录下的 SQLite 元数据路径。"""
+        if not getattr(self, "orig_root", None):
+            return ""
+        return os.path.join(self.orig_root, ".chexagent_meta.sqlite")
+
+    def _get_labels_type(self) -> str:
+        """根据当前模式返回 labels 所属的类型标识。
+
+        - 普通模式："regular"
+        - 任务模式：任务 JSON 文件名（不含扩展名）
+        """
+        if getattr(self, "task_mode", False) and getattr(self, "task_json_path", None):
+            base_name = os.path.splitext(os.path.basename(self.task_json_path))[0]
+            return base_name or "task"
+        return "regular"
+
+    def _get_status_type(self) -> str:
+        """case_status 使用与 labels 相同的类型空间。"""
+        return self._get_labels_type()
+
+    def _ensure_db_schema(self, conn: sqlite3.Connection) -> None:
+        """确保 SQLite 元数据表已创建。"""
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS labels (
+                type       TEXT NOT NULL,
+                key        TEXT NOT NULL,
+                label      INTEGER NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (type, key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS case_status (
+                type       TEXT NOT NULL,
+                key        TEXT NOT NULL,
+                status     TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (type, key)
+            )
+            """
+        )
+        conn.commit()
+
+    def _get_db_connection(self) -> sqlite3.Connection | None:
+        """获取一个已初始化 schema 的 SQLite 连接。
+
+        采用短生命周期连接，调用方用完后负责关闭。
+        """
+        db_path = self._get_meta_db_path()
+        if not db_path:
+            return None
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+        except Exception:
+            pass
+        self._ensure_db_schema(conn)
+        return conn
+
     def _get_labels_json_path(self):
         if self.task_mode and self.task_json_path:
             return self.task_json_path
@@ -57,16 +121,54 @@ class DataMixin:
         self._labels_json_path = self._get_labels_json_path()
         self._labels_cache = {}
         self._labels_dirty = False
-        if self._labels_json_path and os.path.exists(self._labels_json_path):
-            for enc in ("utf-8-sig", "utf-8", "gbk"):
-                try:
-                    with open(self._labels_json_path, "r", encoding=enc) as f:
-                        data = json.load(f)
-                    if isinstance(data, dict):
-                        self._labels_cache = data
-                    break
-                except Exception:
-                    continue
+
+        labels_type = self._get_labels_type()
+        conn = self._get_db_connection()
+        if conn is not None:
+            try:
+                # 1) 尝试从 SQLite 读取当前类型的所有标签
+                cur = conn.execute(
+                    "SELECT key, label FROM labels WHERE type = ?",
+                    (labels_type,),
+                )
+                rows = cur.fetchall()
+                if rows:
+                    self._labels_cache = {k: int(v) for k, v in rows}
+                # 2) 若 DB 为空且存在旧 JSON，则导入一次
+                if not self._labels_cache and self._labels_json_path and os.path.exists(
+                    self._labels_json_path
+                ):
+                    data: dict[str, int] | None = None
+                    for enc in ("utf-8-sig", "utf-8", "gbk"):
+                        try:
+                            with open(self._labels_json_path, "r", encoding=enc) as f:
+                                loaded = json.load(f)
+                            if isinstance(loaded, dict):
+                                data = loaded
+                            break
+                        except Exception:
+                            continue
+                    if data:
+                        # [修复] key 统一规范化为正斜杠，避免 Windows 反斜杠导致查询失败
+                        self._labels_cache = {
+                            str(k).replace("\\", "/"): int(v) for k, v in data.items()
+                        }
+                        for key, label in self._labels_cache.items():
+                            conn.execute(
+                                """
+                                INSERT INTO labels(type, key, label, updated_at)
+                                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                                ON CONFLICT(type, key) DO UPDATE SET
+                                  label = excluded.label,
+                                  updated_at = excluded.updated_at
+                                """,
+                                (labels_type, key, label),
+                            )
+                        conn.commit()
+            finally:
+                conn.close()
+        # 若尚未设置 orig_root，保持空缓存即可
+
         if not getattr(self, "_labels_timer_bound", False):
             self._labels_timer.timeout.connect(lambda: self._flush_labels_cache(False))
             self._labels_timer_bound = True
@@ -79,15 +181,27 @@ class DataMixin:
     def _flush_labels_cache(self, force: bool = True):
         if not self._labels_dirty and not force:
             return
-        path = self._labels_json_path or self._get_labels_json_path()
-        if not path:
+
+        labels_type = self._get_labels_type()
+        conn = self._get_db_connection()
+        if conn is None:
             return
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._labels_cache, f, indent=4, ensure_ascii=False)
+            for key, label in self._labels_cache.items():
+                conn.execute(
+                    """
+                    INSERT INTO labels(type, key, label, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(type, key) DO UPDATE SET
+                      label = excluded.label,
+                      updated_at = excluded.updated_at
+                    """,
+                    (labels_type, str(key), int(label)),
+                )
+            conn.commit()
             self._labels_dirty = False
-        except Exception:
-            return
+        finally:
+            conn.close()
 
     def _get_status_file_path(self):
         if self.task_mode and self.task_json_path:
@@ -96,51 +210,285 @@ class DataMixin:
         return os.path.join(self.orig_root, "case_status.json")
 
     def _load_case_status(self):
-        path = self._get_status_file_path()
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except:
-                return {}
-        return {}
+        status_type = self._get_status_type()
+        conn = self._get_db_connection()
+        if conn is None:
+            # 退回旧 JSON（极端情况下，例如 orig_root 尚未设置）
+            path = self._get_status_file_path()
+            if path and os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+                except Exception:
+                    return {}
+            return {}
+
+        try:
+            cur = conn.execute(
+                "SELECT key, status FROM case_status WHERE type = ?",
+                (status_type,),
+            )
+            rows = cur.fetchall()
+            if rows:
+                return {k: v for k, v in rows}
+
+            # 若 DB 为空，尝试从旧 JSON 导入一次
+            path = self._get_status_file_path()
+            if path and os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        for key, status in data.items():
+                            conn.execute(
+                                """
+                                INSERT INTO case_status(type, key, status, updated_at)
+                                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                                ON CONFLICT(type, key) DO UPDATE SET
+                                  status = excluded.status,
+                                  updated_at = excluded.updated_at
+                                """,
+                                (status_type, str(key), str(status)),
+                            )
+                        conn.commit()
+                        return data
+                except Exception:
+                    return {}
+            return {}
+        finally:
+            conn.close()
 
     def _save_single_case_status(self, case_name, status):
-        data = self._load_case_status()
-        data[case_name] = status
+        status_type = self._get_status_type()
+        conn = self._get_db_connection()
+        if conn is None:
+            return
         try:
-            with open(self._get_status_file_path(), "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
+            conn.execute(
+                """
+                INSERT INTO case_status(type, key, status, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(type, key) DO UPDATE SET
+                  status = excluded.status,
+                  updated_at = excluded.updated_at
+                """,
+                (status_type, str(case_name), str(status)),
+            )
+            conn.commit()
         except Exception as e:
             print(f"Error saving status: {e}")
+        finally:
+            conn.close()
 
     def _save_task_case_status(self, case_name, status):
         if not self.task_mode:
             return
-        data = self._load_case_status()
-        case_entries = self.task_case_entries.get(case_name, [])
-        for entry in case_entries:
-            key = self.task_key_map.get(entry.orig_path)
-            if key:
-                data[key] = status
+        status_type = self._get_status_type()
+        conn = self._get_db_connection()
+        if conn is None:
+            return
         try:
-            with open(self._get_status_file_path(), "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
+            data_changed = False
+            case_entries = self.task_case_entries.get(case_name, [])
+            for entry in case_entries:
+                key = self.task_key_map.get(entry.orig_path)
+                if not key:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO case_status(type, key, status, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(type, key) DO UPDATE SET
+                      status = excluded.status,
+                      updated_at = excluded.updated_at
+                    """,
+                    (status_type, str(key), str(status)),
+                )
+                data_changed = True
+            if data_changed:
+                conn.commit()
         except Exception as e:
             print(f"Error saving status: {e}")
+        finally:
+            conn.close()
+
+    
+    
+    def delete_case(self, case_name: str, remove_files: bool = False) -> None:
+        """删除一个病例的任务/标签/状态记录。
+
+        - 普通模式：
+          - 从 pneumothorax_labels.json 中移除该病例相关的所有键；
+          - 从 case_status.json 中移除该病例键；
+          - 不删除物理文件（remove_files 预留）。
+        - 任务模式：
+          - 从 task_case_entries / task_entries / task_case_order / task_key_map 中移除；
+          - 从任务 JSON(_labels_cache) 与 {task}_case_status.json 中删除对应条目。
+        - 如当前正在查看该病例，将画布与病例视图重置为空。
+        """
+        case_name = str(case_name or "").strip()
+        if not case_name:
+            return
+
+        # 若当前病例即被删除病例，先清空当前视图状态
+        if getattr(self, "current_case_name", None) == case_name:
+            self.current_case_name = ""
+            self.entries.clear()
+            self.thumbnail_strip.clear()
+            self.current_idx = -1
+            if hasattr(self, "info_panel") and hasattr(self.info_panel, "clear"):
+                self.info_panel.clear()
+            if hasattr(self, "canvas"):
+                try:
+                    self.canvas.base_img = None
+                    self.canvas.mask = None
+                    self.canvas._cache_bg_pixmap = None
+                    self.canvas._is_dirty = False
+                    self.canvas.update()
+                except Exception:
+                    pass
+
+        # 任务模式下：按 JSON key 维度删除
+        if self.task_mode:
+            case_entries = list(self.task_case_entries.get(case_name, []))
+            if not case_entries:
+                return
+
+            # 1) 更新内存结构
+            orig_paths = {e.orig_path for e in case_entries}
+            self.task_entries = [e for e in self.task_entries if e.orig_path not in orig_paths]
+            self.task_case_entries.pop(case_name, None)
+            if case_name in self.task_case_order:
+                self.task_case_order.remove(case_name)
+
+            # 2) 初始化标签缓存
+            if not getattr(self, "_labels_cache", None):
+                self._init_labels_cache()
+            labels = self._labels_cache
+
+            # 3) 按 orig_path 找到 JSON key，删除 labels 与 case_status 中的记录
+            status_type = self._get_status_type()
+            labels_type = self._get_labels_type()
+            conn = self._get_db_connection()
+            try:
+                for entry in case_entries:
+                    orig_path = entry.orig_path
+                    json_key = self.task_key_map.pop(orig_path, None)
+                    if not json_key:
+                        continue
+                    # [修复] 统一规范化，防御性处理（task_key_map 源头已规范化，这里再保险一次）
+                    key_str = str(json_key).replace("\\", "/")
+
+                    if key_str in labels:
+                        labels.pop(key_str, None)
+
+                    if conn is not None:
+                        # [修复] 显式 DELETE labels 表中的行，否则 _flush_labels_cache
+                        # 只 INSERT/UPDATE 无法清除被删 key，下次启动会重新加载
+                        conn.execute(
+                            "DELETE FROM labels WHERE type = ? AND key = ?",
+                            (labels_type, key_str),
+                        )
+                        conn.execute(
+                            "DELETE FROM case_status WHERE type = ? AND key = ?",
+                            (status_type, key_str),
+                        )
+
+                    # 物理文件删除目前默认关闭，仅在 remove_files=True 时尝试
+                    if remove_files:
+                        try:
+                            if os.path.isfile(orig_path):
+                                os.remove(orig_path)
+                        except Exception:
+                            pass
+                        try:
+                            if entry.mask_path and os.path.isfile(entry.mask_path):
+                                os.remove(entry.mask_path)
+                        except Exception:
+                            pass
+
+                if conn is not None:
+                    conn.commit()
+            finally:
+                if conn is not None:
+                    conn.close()
+
+            # 4) 写回标签到 SQLite
+            self._labels_dirty = True
+            self._flush_labels_cache(force=True)
+
+            return
+
+        # 普通模式：按病例名前缀删除 labels 与 case_status
+        if not getattr(self, "_labels_cache", None):
+            self._init_labels_cache()
+        labels = self._labels_cache
+
+        prefix = case_name.rstrip("/")
+        keys_to_delete = [
+            k
+            for k in list(labels.keys())
+            if k == prefix or k.startswith(prefix + "/")
+        ]
+        for k in keys_to_delete:
+            labels.pop(k, None)
+        if keys_to_delete:
+            self._schedule_labels_flush()
+
+        # 删除 SQLite 中 labels 表和 case_status 表中该病例的记录
+        conn = self._get_db_connection()
+        if conn is not None:
+            try:
+                labels_type = self._get_labels_type()
+                # [修复] 显式 DELETE labels 表行，否则 flush 只 INSERT/UPDATE，
+                # 被删 key 会遗留在 DB 中，下次启动又被重新加载
+                for k in keys_to_delete:
+                    conn.execute(
+                        "DELETE FROM labels WHERE type = ? AND key = ?",
+                        (labels_type, str(k)),
+                    )
+                conn.execute(
+                    "DELETE FROM case_status WHERE type = ? AND key = ?",
+                    (self._get_status_type(), case_name),
+                )
+                conn.commit()
+            except Exception as e:
+                print(f"Error saving status: {e}")
+            finally:
+                conn.close()
 
     def _reset_cache(self, clear_cache: bool = True, invalidate_prefetch: bool = True):
+        """清理/重置影像缓存与预取状态。
+
+        - clear_cache=True：释放当前影像缓存（_image_cache），避免内存占用。
+        - invalidate_prefetch=True：推进预取 epoch，使旧的预取线程自然退出。
+
+        注意：本方法依赖于 main_window.py 中初始化的：
+        - self._image_cache: OrderedDict
+        - self._cache_lock: threading.Lock
+        - self._prefetch_inflight: set
+        """
         with self._cache_lock:
             if clear_cache:
                 for key, cached_val in list(self._image_cache.items()):
-                    img, mask = cached_val[0], cached_val[1]
-                    self._release_cache_entry(key, img, mask)
+                    if not cached_val:
+                        continue
+                    # cached_val 形如 (img, mask, meta)
+                    try:
+                        img = cached_val[0]
+                        mask = cached_val[1] if len(cached_val) > 1 else None
+                        # 这里只是丢弃引用，实际内存由 GC 回收
+                        del img, mask
+                    except Exception:
+                        pass
                 self._image_cache.clear()
             self._prefetch_inflight.clear()
         if invalidate_prefetch:
             self._next_prefetch_epoch()
 
     def _cache_get(self, key):
+        """读取缓存并更新 LRU 顺序。"""
         with self._cache_lock:
             if key in self._image_cache:
                 val = self._image_cache.pop(key)
@@ -156,16 +504,19 @@ class DataMixin:
         )
 
     def _cache_set(self, key, value):
+        """写入缓存并按当前模式上限做 LRU 淘汰。"""
         meta = None
         if len(value) == 3:
             img, mask, meta = value
         else:
             img, mask = value
+
         with self._cache_lock:
             if key in self._image_cache:
                 cached_val = self._image_cache.pop(key)
                 old_img, old_mask = cached_val[0], cached_val[1]
                 self._release_cache_entry(key, old_img, old_mask)
+
             self._image_cache[key] = (img, mask, meta)
             active_max = self._get_active_cache_max()
             while len(self._image_cache) > active_max:
@@ -188,11 +539,13 @@ class DataMixin:
         h, w = shape
         if h <= 0 or w <= 0:
             return np.zeros(shape, dtype=np.uint8)
+
         max_shape = getattr(self, "_mask_pool_max_shape", None)
         if not max_shape or h > max_shape[0] or w > max_shape[1]:
             max_h = max(h, max_shape[0] if max_shape else 0)
             max_w = max(w, max_shape[1] if max_shape else 0)
             self._reset_mask_pool((max_h, max_w))
+
         if self._mask_pool:
             base = self._mask_pool.pop()
         else:
@@ -200,17 +553,346 @@ class DataMixin:
                 return np.zeros(shape, dtype=np.uint8)
             base = np.zeros(self._mask_pool_max_shape, dtype=np.uint8)
             self._mask_pool_size += 1
+
         view = base[:h, :w]
         view.fill(0)
         self._mask_pool_refs[id(view)] = base
         return view
 
     def _release_cache_entry(self, key, img, mask):
-        if getattr(self, "_mask_pool_refs", None):
-            base = self._mask_pool_refs.pop(id(mask), None)
+        refs = getattr(self, "_mask_pool_refs", None)
+        if refs:
+            base = refs.pop(id(mask), None)
             if base is not None:
                 self._mask_pool.append(base)
         del img, mask
+
+    def rename_case(self, case_name: str, new_case_name: str) -> None:
+        """重命名病例标识，并同步更新磁盘路径和 JSON / 状态。
+
+        支持场景：
+        - 普通模式 + CT 序列：按病例目录重命名 orig_root / mask_root 下的文件夹；
+        - 普通模式 + X 光单张：按相对路径重命名单张文件以及对应掩码文件；
+        - 任务模式：当前仅更新病例分组名（task_case_entries / task_case_order），
+          不改物理路径和 JSON key（后续可按需扩展）。
+        """
+
+        case_name = str(case_name or "").strip()
+        new_case_name = str(new_case_name or "").strip()
+        if not case_name or not new_case_name or case_name == new_case_name:
+            return
+
+        # 任务模式：根据扫描模式分别处理
+        if getattr(self, "task_mode", False):
+            case_entries = list(self.task_case_entries.get(case_name, []))
+            if not case_entries:
+                return
+
+            # X 光任务模式：执行完整的物理重命名 + 任务 JSON / 状态同步
+            if self.scan_mode == ScanMode.XRAY_SINGLE and self.orig_root:
+                if not getattr(self, "_labels_cache", None):
+                    self._init_labels_cache()
+                labels = self._labels_cache
+                status_map = self._load_case_status()
+
+                for entry in case_entries:
+                    old_orig = entry.orig_path
+                    # 旧相对路径
+                    try:
+                        old_rel = os.path.relpath(old_orig, self.orig_root).replace("\\", "/")
+                    except Exception:
+                        old_rel = case_name
+
+                    # 构造新的相对路径：优先做前缀替换
+                    if old_rel == case_name or old_rel.startswith(case_name + "/"):
+                        suffix = old_rel[len(case_name) :]
+                        new_rel = new_case_name + suffix
+                    else:
+                        new_rel = new_case_name
+
+                    new_orig = os.path.normpath(os.path.join(self.orig_root, new_rel))
+
+                    # 物理重命名原图
+                    try:
+                        new_dir = os.path.dirname(new_orig)
+                        if new_dir and not os.path.exists(new_dir):
+                            os.makedirs(new_dir, exist_ok=True)
+                        if os.path.exists(old_orig) and not os.path.exists(new_orig):
+                            os.rename(old_orig, new_orig)
+                            # 删除发生重命名那一级的旧目录（如果已经为空）
+                            old_dir = os.path.dirname(old_orig)
+                            try:
+                                if (
+                                    old_dir
+                                    and os.path.isdir(old_dir)
+                                    and not os.listdir(old_dir)
+                                ):
+                                    os.rmdir(old_dir)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        print(f"Error renaming X-ray task case file: {e}")
+
+                    # 尝试重命名掩码文件
+                    try:
+                        old_mask = self._resolve_xray_mask_path(old_orig, rel_src=old_rel)
+                        if not old_mask:
+                            old_mask = self._build_default_xray_mask_path(old_orig, rel_src=old_rel)
+                        if old_mask and os.path.exists(old_mask):
+                            new_mask = self._build_default_xray_mask_path(new_orig, rel_src=new_rel)
+                            new_mask_dir = os.path.dirname(new_mask)
+                            if new_mask_dir and not os.path.exists(new_mask_dir):
+                                os.makedirs(new_mask_dir, exist_ok=True)
+                            if not os.path.exists(new_mask):
+                                os.rename(old_mask, new_mask)
+                    except Exception as e:
+                        print(f"Error renaming X-ray task mask file: {e}")
+
+                    # 更新 entry 内存状态
+                    entry.orig_path = new_orig
+                    entry.case_name = new_case_name
+                    entry.filename = os.path.basename(new_rel) or new_rel
+                    # 更新掩码路径与 has_mask
+                    try:
+                        new_mask_path = self._build_default_xray_mask_path(new_orig, rel_src=new_rel)
+                        entry.mask_path = new_mask_path
+                        entry.has_mask = os.path.exists(new_mask_path)
+                    except Exception:
+                        # 若推导失败则保持原有掩码路径
+                        pass
+
+                    # 更新 task_key_map 与任务 JSON / 状态 JSON 键
+                    old_key_obj = self.task_key_map.pop(old_orig, None)
+                    old_key_str = (
+                        str(old_key_obj).replace("\\", "/")
+                        if old_key_obj is not None
+                        else old_rel
+                    )
+                    # 任务 JSON 约定使用相对路径 key
+                    new_key_str = new_rel
+
+                    self.task_key_map[new_orig] = new_key_str
+
+                    if old_key_str in labels:
+                        labels[new_key_str] = labels.pop(old_key_str)
+
+                    if old_key_str in status_map and new_key_str not in status_map:
+                        status_map[new_key_str] = status_map.pop(old_key_str)
+
+                # 更新病例分组映射与顺序
+                self.task_case_entries[new_case_name] = case_entries
+                if case_name in self.task_case_entries:
+                    self.task_case_entries.pop(case_name, None)
+                if case_name in self.task_case_order and new_case_name not in self.task_case_order:
+                    idx = self.task_case_order.index(case_name)
+                    self.task_case_order[idx] = new_case_name
+
+                # 写回任务 JSON 与状态（SQLite）
+                self._labels_dirty = True
+                self._flush_labels_cache(force=True)
+                # [修复] 写 SQLite 而非 JSON 文件
+                _conn = self._get_db_connection()
+                if _conn is not None:
+                    try:
+                        _st = self._get_status_type()
+                        for _k, _v in status_map.items():
+                            _conn.execute(
+                                """
+                                INSERT INTO case_status(type, key, status, updated_at)
+                                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                                ON CONFLICT(type, key) DO UPDATE SET
+                                  status = excluded.status,
+                                  updated_at = excluded.updated_at
+                                """,
+                                (_st, str(_k), str(_v)),
+                            )
+                        # 删除已被 pop 掉的旧 key（status_map 里已不存在）
+                        _conn.execute(
+                            "DELETE FROM case_status WHERE type = ? AND key NOT IN (%s)"
+                            % ",".join("?" * len(status_map)),
+                            [_st] + [str(k) for k in status_map],
+                        ) if status_map else _conn.execute(
+                            "DELETE FROM case_status WHERE type = ?", (_st,)
+                        )
+                        _conn.commit()
+                    except Exception as e:
+                        print(f"Error saving status to SQLite: {e}")
+                    finally:
+                        _conn.close()
+
+                # 重命名后，按旧病例根目录（第一段）尝试清理空树
+                old_root_seg = str(case_name).replace("\\", "/").strip("/").split("/")[0]
+                if old_root_seg:
+                    old_orig_root = os.path.join(self.orig_root, old_root_seg)
+                    self._delete_tree_if_no_data_files(old_orig_root)
+                    if (
+                        getattr(self, "mask_root", "")
+                        and self.mask_root != self.orig_root
+                    ):
+                        old_mask_root = os.path.join(self.mask_root, old_root_seg)
+                        self._delete_tree_if_no_data_files(old_mask_root)
+
+                return
+
+            # 其他任务模式（例如 CT 序列任务）：目前先只调整病例分组名和 entry.case_name
+            for entry in case_entries:
+                entry.case_name = new_case_name
+
+            self.task_case_entries[new_case_name] = self.task_case_entries.pop(case_name)
+            if case_name in self.task_case_order and new_case_name not in self.task_case_order:
+                idx = self.task_case_order.index(case_name)
+                self.task_case_order[idx] = new_case_name
+
+            return
+
+        # ---------------- 非任务模式：处理物理路径 + JSON 状态 -----------------
+        # 1) 物理重命名
+        if self.scan_mode == ScanMode.CT_SEQUENCE and self.orig_root:
+            # CT：病例名 = orig_root 下一级目录
+            old_dir = os.path.join(self.orig_root, case_name)
+            new_dir = os.path.join(self.orig_root, new_case_name)
+            try:
+                if os.path.isdir(old_dir) and not os.path.exists(new_dir):
+                    os.rename(old_dir, new_dir)
+            except Exception as e:
+                print(f"Error renaming CT case folder: {e}")
+
+            # 双文件夹模式：同步重命名 mask_root 下的目录
+            try:
+                if is_dual_folder_mode(self.orig_root, self.mask_root) and self.mask_root:
+                    old_mask_dir = os.path.join(self.mask_root, case_name)
+                    new_mask_dir = os.path.join(self.mask_root, new_case_name)
+                    if os.path.isdir(old_mask_dir) and not os.path.exists(new_mask_dir):
+                        os.rename(old_mask_dir, new_mask_dir)
+            except Exception as e:
+                print(f"Error renaming CT mask folder: {e}")
+
+        elif self.scan_mode == ScanMode.XRAY_SINGLE and self.orig_root:
+            # X 光：病例名 = 相对路径
+            old_path = os.path.join(self.orig_root, case_name)
+            new_path = os.path.join(self.orig_root, new_case_name)
+            try:
+                new_dir = os.path.dirname(new_path)
+                if new_dir and not os.path.exists(new_dir):
+                    os.makedirs(new_dir, exist_ok=True)
+                if os.path.exists(old_path) and not os.path.exists(new_path):
+                    os.rename(old_path, new_path)
+            except Exception as e:
+                print(f"Error renaming X-ray case file: {e}")
+
+            # 尝试同步重命名掩码文件
+            try:
+                old_mask = self._resolve_xray_mask_path(old_path, rel_src=case_name)
+                if not old_mask:
+                    old_mask = self._build_default_xray_mask_path(old_path, rel_src=case_name)
+                if old_mask and os.path.exists(old_mask):
+                    new_mask = self._build_default_xray_mask_path(new_path, rel_src=new_case_name)
+                    new_mask_dir = os.path.dirname(new_mask)
+                    if new_mask_dir and not os.path.exists(new_mask_dir):
+                        os.makedirs(new_mask_dir, exist_ok=True)
+                    if not os.path.exists(new_mask):
+                        os.rename(old_mask, new_mask)
+                        # 如旧掩码目录已空，删除该层目录
+                        old_mask_dir = os.path.dirname(old_mask)
+                        try:
+                            if (
+                                old_mask_dir
+                                and os.path.isdir(old_mask_dir)
+                                and not os.listdir(old_mask_dir)
+                            ):
+                                os.rmdir(old_mask_dir)
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"Error renaming X-ray mask file: {e}")
+
+            # 重命名后，按旧病例根目录（第一段）尝试清理空树
+            old_root_seg = str(case_name).replace("\\", "/").strip("/").split("/")[0]
+            if old_root_seg:
+                old_orig_root = os.path.join(self.orig_root, old_root_seg)
+                self._delete_tree_if_no_data_files(old_orig_root)
+                if getattr(self, "mask_root", "") and self.mask_root != self.orig_root:
+                    old_mask_root = os.path.join(self.mask_root, old_root_seg)
+                    self._delete_tree_if_no_data_files(old_mask_root)
+
+        # 2) 更新 pneumothorax_labels.json（标签 JSON）
+        if not getattr(self, "_labels_cache", None):
+            self._init_labels_cache()
+        labels = self._labels_cache
+        new_labels = {}
+        prefix = case_name.rstrip("/")
+        for k, v in labels.items():
+            if k == prefix or k.startswith(prefix + "/"):
+                suffix = k[len(prefix) :]
+                new_k = new_case_name + suffix
+                new_labels[new_k] = v
+            else:
+                new_labels[k] = v
+        self._labels_cache = new_labels
+        self._schedule_labels_flush()
+
+        # 3) 更新 case_status（SQLite）
+        status_map = self._load_case_status()
+        if case_name in status_map and new_case_name not in status_map:
+            status_map[new_case_name] = status_map.pop(case_name)
+        # [修复] 写 SQLite 而非 JSON 文件
+        _conn = self._get_db_connection()
+        if _conn is not None:
+            try:
+                _st = self._get_status_type()
+                if new_case_name in status_map:
+                    _conn.execute(
+                        """
+                        INSERT INTO case_status(type, key, status, updated_at)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(type, key) DO UPDATE SET
+                          status = excluded.status,
+                          updated_at = excluded.updated_at
+                        """,
+                        (_st, str(new_case_name), str(status_map[new_case_name])),
+                    )
+                _conn.execute(
+                    "DELETE FROM case_status WHERE type = ? AND key = ?",
+                    (_st, str(case_name)),
+                )
+                _conn.commit()
+            except Exception as e:
+                print(f"Error saving status to SQLite: {e}")
+            finally:
+                _conn.close()
+
+    def _delete_tree_if_no_data_files(self, root_dir: str) -> None:
+        """如果 root_dir 子树中没有任何 DICOM 或掩码文件，则删除整棵目录树。
+
+        仅删除以 .dcm/.dicom 及 MASK_FILE_EXTENSIONS 结尾的文件所在的空目录树，
+        避免误删仍包含数据的病例根目录。
+        """
+        if not root_dir or not os.path.isdir(root_dir):
+            return
+
+        data_exts = (".dcm", ".dicom") + MASK_FILE_EXTENSIONS
+
+        # 1) 先检查是否还存在任何数据文件
+        has_data = False
+        for dirpath, _, filenames in os.walk(root_dir):
+            for name in filenames:
+                lower = name.lower()
+                if lower.endswith(data_exts):
+                    has_data = True
+                    break
+            if has_data:
+                break
+        if has_data:
+            return
+
+        # 2) 自底向上删除所有空目录
+        for dirpath, _, _ in os.walk(root_dir, topdown=False):
+            try:
+                if os.path.isdir(dirpath) and not os.listdir(dirpath):
+                    os.rmdir(dirpath)
+            except OSError:
+                # 目录非空或权限不足时跳过
+                pass
 
     @staticmethod
     def _split_compound_ext(path_str):
@@ -229,6 +911,19 @@ class DataMixin:
     def _get_xray_mask_stem(cls, path_str):
         return os.path.basename(cls._strip_compound_ext(path_str or ""))
 
+    def _extract_meaningful_stem(self, filename: str) -> str:
+        """提取文件名中真正有意义的 stem，用于模糊匹配。"""
+        no_ext = self._strip_compound_ext(filename)
+        if not no_ext:
+            return ""
+
+        lower_no_ext = no_ext.lower()
+        for suffix in ("_mask", "-mask", "_label", "-label", "_pred"):
+            if lower_no_ext.endswith(suffix):
+                no_ext = no_ext[: -len(suffix)]
+                break
+        return no_ext.lower()
+
     def _is_generic_xray_mask_name(self, filename):
         stem = self._get_xray_mask_stem(filename).lower()
         return bool(stem) and (
@@ -237,22 +932,6 @@ class DataMixin:
             or re.fullmatch(r"\d+", stem) is not None
         )
 
-    def _is_xray_mask_sidecar(self, filename):
-        lower = os.path.basename(filename).lower()
-        stem = self._get_xray_mask_stem(lower).lower()
-        has_mask_ext = lower.endswith(MASK_FILE_EXTENSIONS)
-
-        # NIfTI 在当前项目里始终按掩码侧车处理
-        if self._is_nifti_file(lower):
-            return True
-
-        # 仅当文件本身就是常见掩码格式时，才把 _mask / Untitled / 纯数字 命名
-        # 视为侧车掩码；否则像“1”“2”这类无扩展名 DICOM 会被误排除，导致整目录扫不出来。
-        if has_mask_ext and stem.endswith("_mask"):
-            return True
-        if has_mask_ext and self._is_generic_xray_mask_name(lower):
-            return True
-        return False
     @classmethod
     def _get_xray_composite_sidecar_source_stem(cls, filename):
         """
@@ -286,11 +965,10 @@ class DataMixin:
         if self._is_nifti_file(lower):
             return True
 
-        # 新增：识别 *.dcm.png / *.dicom.png / *.jpg.png 这类复合扩展名侧车
+        # 识别 *.dcm.png / *.dicom.png / *.jpg.png 这类复合扩展名侧车
         if self._get_xray_composite_sidecar_source_stem(lower):
             return True
 
-        # 原有规则保留
         if has_mask_ext and stem.endswith("_mask"):
             return True
         if has_mask_ext and self._is_generic_xray_mask_name(lower):
@@ -343,6 +1021,7 @@ class DataMixin:
             if dual_mode and self.mask_root
             else src_dir
         )
+
         cache_key = (src_dir, mask_dir)
         cache = getattr(self, "_xray_dir_match_cache", None)
         if cache is None:
@@ -351,84 +1030,137 @@ class DataMixin:
         if cache_key in cache:
             return dict(cache[cache_key])
 
+        # 1. 收集所有原图
         source_filenames = self._iter_xray_source_filenames(src_dir)
         if not source_filenames:
             cache[cache_key] = {}
             return {}
 
-        mapping = {}
-        used_masks = set()
-        exact_exts = list(XRAY_MASK_CANDIDATE_EXTENSIONS)
-
-        def _candidate_paths(file_stem, rel_stem, filename, rel_src):
-            if dual_mode and self.mask_root:
-                base_rel = rel_stem.replace("\\", "/")
-                rel_with_src_ext = rel_src.replace("\\", "/")
-                return (
-                    [os.path.join(self.mask_root, base_rel + ext) for ext in exact_exts]
-                    + [os.path.join(self.mask_root, base_rel + "_mask" + ext) for ext in exact_exts]
-                    + [os.path.join(self.mask_root, rel_with_src_ext + ext) for ext in exact_exts]
-                )
-            return (
-                [os.path.join(src_dir, file_stem + ext) for ext in exact_exts]
-                + [os.path.join(src_dir, file_stem + "_mask" + ext) for ext in exact_exts]
-                + [os.path.join(src_dir, filename + ext) for ext in exact_exts]
-            )
-
-        unmatched = []
-        for filename in source_filenames:
-            full_src = os.path.join(src_dir, filename)
-            rel_src = os.path.join(rel_dir, filename).replace("\\", "/") if rel_dir else filename
-            file_stem = self._strip_compound_ext(filename)
-            rel_stem = self._strip_compound_ext(rel_src)
-            chosen = ""
-            seen = set()
-            for candidate in _candidate_paths(file_stem, rel_stem, filename, rel_src):
-                if not candidate:
-                    continue
-                norm_candidate = os.path.normpath(candidate)
-                if norm_candidate in seen:
-                    continue
-                seen.add(norm_candidate)
-                if norm_candidate == os.path.normpath(full_src):
-                    continue
-                if os.path.exists(candidate):
-                    chosen = candidate
-                    used_masks.add(norm_candidate)
-                    break
-            if chosen:
-                mapping[os.path.normpath(full_src)] = chosen
-            else:
-                unmatched.append((filename, full_src))
-
-        generic_masks = []
+        # 2. 收集当前目录下所有合法掩码文件（含位图和 NIfTI）
+        all_mask_paths = set()
         if os.path.isdir(mask_dir):
             try:
                 for mask_name in os.listdir(mask_dir):
                     mask_path = os.path.join(mask_dir, mask_name)
                     if not os.path.isfile(mask_path):
                         continue
-                    lower = mask_name.lower()
-                    if not lower.endswith(MASK_FILE_EXTENSIONS):
-                        continue
-                    norm_mask = os.path.normpath(mask_path)
-                    if norm_mask in used_masks:
-                        continue
-                    if self._is_generic_xray_mask_name(mask_name):
-                        generic_masks.append(mask_path)
+                    lower = os.path.basename(mask_name).lower()
+                    if lower.endswith(MASK_FILE_EXTENSIONS) or self._is_nifti_file(lower):
+                        all_mask_paths.add(os.path.normpath(mask_path))
             except OSError:
-                generic_masks = []
+                pass
 
-        generic_masks.sort(key=lambda p: natural_sort_key(os.path.basename(p)))
-        unmatched.sort(key=lambda item: natural_sort_key(item[0]))
+        # 剔除掉和原图完全同名的伪装者，防止把原图误当掩码
+        for filename in source_filenames:
+            all_mask_paths.discard(os.path.normpath(os.path.join(src_dir, filename)))
 
-        if generic_masks and unmatched:
-            can_pair = len(generic_masks) == len(unmatched) or (
-                len(generic_masks) == 1 and len(unmatched) == 1
+        mapping = {}
+        used_masks = set()
+        unmatched_sources = []
+        exact_exts = list(XRAY_MASK_CANDIDATE_EXTENSIONS)
+
+        # ==========================================
+        # 第一层：精确匹配（保持原有高优先级逻辑）
+        # ==========================================
+        for filename in source_filenames:
+            full_src = os.path.normpath(os.path.join(src_dir, filename))
+            rel_src = (
+                os.path.join(rel_dir, filename).replace("\\", "/") if rel_dir else filename
             )
-            if can_pair:
-                for (_, full_src), mask_path in zip(unmatched, generic_masks):
-                    mapping[os.path.normpath(full_src)] = mask_path
+            file_stem = self._strip_compound_ext(filename)
+            rel_stem = self._strip_compound_ext(rel_src)
+
+            if dual_mode and self.mask_root:
+                base_rel = rel_stem.replace("\\", "/")
+                rel_with_src_ext = rel_src.replace("\\", "/")
+                candidates = (
+                    [os.path.join(self.mask_root, base_rel + ext) for ext in exact_exts]
+                    + [
+                        os.path.join(self.mask_root, base_rel + "_mask" + ext)
+                        for ext in exact_exts
+                    ]
+                    + [
+                        os.path.join(self.mask_root, rel_with_src_ext + ext)
+                        for ext in exact_exts
+                    ]
+                )
+            else:
+                candidates = (
+                    [os.path.join(src_dir, file_stem + ext) for ext in exact_exts]
+                    + [os.path.join(src_dir, file_stem + "_mask" + ext) for ext in exact_exts]
+                    + [os.path.join(src_dir, filename + ext) for ext in exact_exts]
+                )
+
+            chosen = ""
+            seen = set()
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                norm_candidate = os.path.normpath(candidate)
+                if norm_candidate in seen:
+                    continue
+                seen.add(norm_candidate)
+                if norm_candidate == full_src:
+                    continue
+                if norm_candidate in all_mask_paths and norm_candidate not in used_masks:
+                    chosen = norm_candidate
+                    break
+
+            if chosen:
+                mapping[full_src] = chosen
+                used_masks.add(chosen)
+            else:
+                unmatched_sources.append((filename, full_src))
+
+        if not unmatched_sources:
+            cache[cache_key] = dict(mapping)
+            return dict(mapping)
+
+        # ==========================================
+        # 第二层：模糊包含匹配
+        # 只要掩码 stem 包含原图 stem，或原图 stem 包含掩码 stem，即视为匹配
+        # ==========================================
+        still_unmatched = []
+        available_masks = sorted(
+            list(all_mask_paths - used_masks),
+            key=lambda p: natural_sort_key(os.path.basename(p)),
+        )
+
+        for filename, full_src in unmatched_sources:
+            src_stem = self._extract_meaningful_stem(filename)
+            if not src_stem:
+                still_unmatched.append((filename, full_src))
+                continue
+
+            found = False
+            for mask_path in list(available_masks):
+                mask_stem = self._extract_meaningful_stem(os.path.basename(mask_path))
+                if not mask_stem:
+                    continue
+                if src_stem in mask_stem or mask_stem in src_stem:
+                    mapping[full_src] = mask_path
+                    used_masks.add(mask_path)
+                    available_masks.remove(mask_path)
+                    found = True
+                    break
+
+            if not found:
+                still_unmatched.append((filename, full_src))
+
+        if not still_unmatched or not available_masks:
+            cache[cache_key] = dict(mapping)
+            return dict(mapping)
+
+        # ==========================================
+        # 第三层：终极数量盲配
+        # 数量完全相等时，按自然排序一对一强行绑定
+        # ==========================================
+        still_unmatched.sort(key=lambda item: natural_sort_key(item[0]))
+        available_masks.sort(key=lambda p: natural_sort_key(os.path.basename(p)))
+
+        if len(still_unmatched) == len(available_masks):
+            for (_, full_src), mask_path in zip(still_unmatched, available_masks):
+                mapping[full_src] = mask_path
 
         cache[cache_key] = dict(mapping)
         return dict(mapping)
@@ -437,9 +1169,7 @@ class DataMixin:
         if not orig_path:
             return ""
 
-        rel_src = (rel_src or os.path.relpath(orig_path, self.orig_root)).replace(
-            "\\", "/"
-        )
+        rel_src = (rel_src or os.path.relpath(orig_path, self.orig_root)).replace("\\", "/")
         src_dir = os.path.dirname(orig_path)
         rel_dir = os.path.dirname(rel_src)
         mapping = self._build_xray_dir_mask_map(src_dir, rel_dir)
@@ -476,6 +1206,37 @@ class DataMixin:
         # 回退：默认 PNG 路径
         return default_mask_path(p_mask, stem, DEFAULT_MASK_BITMAP_EXT)
 
+    def _build_ct_case_entries(self, case_name):
+        p_orig = (
+            os.path.join(self.orig_root, case_name)
+            if case_name != "Root"
+            else self.orig_root
+        )
+        p_mask = os.path.join(self.mask_root, case_name) if self.mask_root else p_orig
+
+        files = []
+        exts = set(CT_SOURCE_EXTENSIONS)
+        for root, _, filenames in os.walk(p_orig):
+            for filename in filenames:
+                if os.path.splitext(filename)[1].lower() not in exts:
+                    continue
+                full_src = os.path.join(root, filename)
+                rel_in_case = os.path.relpath(full_src, p_orig)
+                rel_src = os.path.relpath(full_src, self.orig_root).replace("\\", "/")
+                mask_path = self._resolve_ct_mask_path(full_src, p_mask, rel_in_case)
+                files.append(
+                    ImageEntry(
+                        case_name=case_name,
+                        orig_path=full_src,
+                        mask_path=mask_path,
+                        filename=rel_in_case,
+                        has_mask=os.path.exists(mask_path),
+                        has_pneumothorax=self._labels_cache.get(rel_src, 0),
+                    )
+                )
+        files.sort(key=lambda x: natural_sort_key(x.filename))
+        return files
+
     # ------------------------------------------------------------------
     # 数据加载核心：磁盘读取 / 缓存读取（不涉及任何 UI 操作）
     # ------------------------------------------------------------------
@@ -499,15 +1260,15 @@ class DataMixin:
 
         mask = None
         if os.path.exists(entry.mask_path):
-            # [修复] 当掩码是 NIfTI、原图是 DICOM 时，不传 reference_image_path。
-            # 原因：本应用保存的掩码与原图共享像素网格，target_shape 足以保证对齐；
-            # 而传入 DICOM 做参考会触发 read_mask_file 的物理空间重采样，
-            # 一旦 NIfTI 的 spacing 与 DICOM 不一致（写入时 CopyInformation 静默失败），
-            # 掩码就会被放大数倍。
-            # 用 meta is not None 判断比检查扩展名更可靠（能覆盖无扩展名的 DICOM）。
+            # [修复] 本应用保存的 NIfTI 掩码始终与原图共享像素网格，
+            # target_shape 足以保证对齐。传 reference_image_path 会触发
+            # read_mask_file 的物理空间重采样，一旦 NIfTI 的 spacing 与
+            # 参考图不一致（写入时 CopyInformation 可能静默失败，遗留默认
+            # spacing），掩码就会被放大，表现为"加载回来全红"。
+            # 原判断仅覆盖 "DICOM + NIfTI"，这里扩展到任何 NIfTI 掩码，
+            # 因为读取风险来自 NIfTI 的 spacing 元数据，与原图格式无关。
             mask_is_nifti = entry.mask_path.lower().endswith((".nii", ".nii.gz"))
-            loaded_as_dicom = meta is not None
-            ref_path = None if (mask_is_nifti and loaded_as_dicom) else entry.orig_path
+            ref_path = None if mask_is_nifti else entry.orig_path
 
             mask, _ = read_mask_file(
                 entry.mask_path,
@@ -731,52 +1492,93 @@ class DataMixin:
         files.sort(key=lambda x: natural_sort_key(x.filename))
         return files
 
-    def _build_ct_case_entries(self, case_name):
-        p_orig = (
-            os.path.join(self.orig_root, case_name)
-            if case_name != "Root"
-            else self.orig_root
-        )
-        p_mask = os.path.join(self.mask_root, case_name) if self.mask_root else p_orig
+    def _refresh_task_progress_ui(self) -> None:
+          """根据当前 task_mode / 列表状态刷新任务进度相关 UI。"""
+          # 非任务模式：恢复 UI 到普通样式
+          if not getattr(self, "task_mode", False):
+              if hasattr(self, "update_case_list_headers"):
+                  self.update_case_list_headers()
+              if hasattr(self, "_update_task_status_bar"):
+                  self._update_task_status_bar(
+                      task_name="",
+                      done=0,
+                      total=0,
+                      positive_cases=None,
+                  )
+              if hasattr(self, "_update_window_title"):
+                  self._update_window_title()
+              return
 
-        files = []
-        exts = set(CT_SOURCE_EXTENSIONS)
-        for root, _, filenames in os.walk(p_orig):
-            for filename in filenames:
-                if os.path.splitext(filename)[1].lower() not in exts:
-                    continue
-                full_src = os.path.join(root, filename)
-                rel_in_case = os.path.relpath(full_src, p_orig)
-                rel_src = os.path.relpath(full_src, self.orig_root).replace("\\", "/")
-                mask_path = self._resolve_ct_mask_path(full_src, p_mask, rel_in_case)
-                files.append(
-                    ImageEntry(
-                        case_name=case_name,
-                        orig_path=full_src,
-                        mask_path=mask_path,
-                        filename=rel_in_case,
-                        has_mask=os.path.exists(mask_path),
-                        has_pneumothorax=self._labels_cache.get(rel_src, 0),
-                    )
-                )
-        files.sort(key=lambda x: natural_sort_key(x.filename))
-        return files
+          # 任务模式：根据病例列表统计进度
+          done = self.list_annotated.count()
+          pending = self.list_todo.count()
+          total_cases = done + pending
 
+          # 阳性病例数：基于 task_case_entries 按病例聚合
+          positive_cases = 0
+          for case_name in getattr(self, "task_case_order", []):
+              entries = self.task_case_entries.get(case_name, [])
+              if any(e.has_pneumothorax == 1 for e in entries):
+                  positive_cases += 1
+
+          task_name = ""
+          if getattr(self, "task_json_path", ""):
+              from pathlib import Path
+              task_name = Path(self.task_json_path).stem
+
+          # 更新左侧分组标题
+          if hasattr(self, "update_case_list_headers"):
+              self.update_case_list_headers(
+                  total_cases=total_cases,
+                  done_cases=done,
+                  pending_cases=pending,
+              )
+
+          # 更新状态栏黄色任务进度标签
+          if hasattr(self, "_update_task_status_bar"):
+              self._update_task_status_bar(
+                  task_name=task_name,
+                  done=done,
+                  total=total_cases,
+                  positive_cases=positive_cases,
+              )
+
+          # 更新窗口标题
+          if hasattr(self, "_update_window_title"):
+              self._update_window_title()
+    
+    
+    
     def _build_case_entries(self, case_name):
+        """根据当前模式构建指定病例的 ImageEntry 列表。
+
+        - 任务模式：直接使用 task_case_entries 中的 entries。
+        - 普通 CT 模式：按病例目录展开所有切片。
+        - 普通 X 光模式：按病例名（相对路径）展开。
+        """
         if self.task_mode:
             files = list(self.task_case_entries.get(case_name, []))
             files.sort(key=lambda x: natural_sort_key(x.filename))
             return files
+
         if self.scan_mode == ScanMode.CT_SEQUENCE:
             return self._build_ct_case_entries(case_name)
+
         return self._build_xray_case_entries(case_name)
 
     def _expand_case_to_entries(self, case_name):
-        """把一个病例名展开成 ImageEntry 列表。"""
+        """把一个病例名展开成 ImageEntry 列表，用于跨病例预取等场景。"""
         if not case_name:
             return []
+
+        if self.task_mode:
+            files = list(self.task_case_entries.get(case_name, []))
+            files.sort(key=lambda x: natural_sort_key(x.filename))
+            return files
+
         if self.scan_mode == ScanMode.CT_SEQUENCE:
             return self._build_ct_case_entries(case_name)
+
         return self._build_xray_case_entries(case_name)
 
     def _prefetch_case_worker(self, epoch, token, entries):
@@ -827,9 +1629,87 @@ class DataMixin:
         if path:
             self.load_task_json(path)
 
-    # ------------------------------------------------------------------
-    # load_task_json 拆分：数据层 helper（不碰 UI）
-    # ------------------------------------------------------------------
+    def export_selected_task_json(self):
+        selected_items = list(self.list_annotated.selectedItems()) + list(
+            self.list_todo.selectedItems()
+        )
+        if not selected_items:
+            QMessageBox.information(self, "提示", "请先在病例列表中选择至少一个病例。")
+            return
+
+        selected_case_names = []
+        for item in selected_items:
+            case_name = item.data(Qt.UserRole)
+            if not case_name:
+                continue
+            selected_case_names.append(case_name)
+
+        if not selected_case_names:
+            QMessageBox.information(self, "提示", "选中的条目没有有效病例标识。")
+            return
+
+        task_dict = {}
+
+        # 任务模式：严格沿用原始任务 JSON 的 key
+        if self.task_mode:
+            for case_name in selected_case_names:
+                case_entries = self.task_case_entries.get(case_name, [])
+                for entry in case_entries:
+                    json_key = self.task_key_map.get(entry.orig_path)
+                    if not json_key:
+                        continue
+                    json_key_str = str(json_key).replace("\\", "/")
+                    has_pneumo = entry.has_pneumothorax
+                    has_pneumo = int(self._labels_cache.get(json_key_str, has_pneumo))
+                    task_dict[json_key_str] = has_pneumo
+        else:
+            # 普通模式：根据扫描模式区分 CT / X 光
+            if self.scan_mode == ScanMode.CT_SEQUENCE:
+                base_dir = self.orig_root or ""
+                for case_name in selected_case_names:
+                    entries = self._build_ct_case_entries(case_name)
+                    for entry in entries:
+                        rel_src = os.path.relpath(entry.orig_path, base_dir).replace(
+                            "\\", "/"
+                        )
+                        has_pneumo = entry.has_pneumothorax
+                        has_pneumo = int(self._labels_cache.get(rel_src, has_pneumo))
+                        task_dict[rel_src] = has_pneumo
+            else:
+                # X 光：UserRole 就是相对路径
+                for case_name in selected_case_names:
+                    rel_src = str(case_name).replace("\\", "/")
+                    has_pneumo = int(self._labels_cache.get(rel_src, 0))
+                    task_dict[rel_src] = has_pneumo
+
+        if not task_dict:
+            QMessageBox.information(self, "提示", "未能构造任何任务条目，请检查选择。")
+            return
+
+        default_name = "task_selected.json"
+        if self.task_mode and self.task_json_path:
+            from pathlib import Path
+
+            base = Path(self.task_json_path).stem
+            default_name = f"{base}_subset.json"
+
+        default_save_path = os.path.join(self.orig_root or "", default_name)
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出子任务 JSON",
+            default_save_path,
+            "JSON Files (*.json)",
+        )
+
+        if save_path:
+            try:
+                with open(save_path, "w", encoding="utf-8") as f:
+                    json.dump(task_dict, f, indent=4, ensure_ascii=False)
+                self.statusBar().showMessage(
+                    f"成功导出子任务 JSON: {os.path.basename(save_path)}", 5000
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"导出失败:\n{e}")
 
     def _read_task_json(self, json_path):
         """多编码读取 JSON 文件，返回 dict 或 None。"""
@@ -883,9 +1763,11 @@ class DataMixin:
             if self.scan_mode == ScanMode.CT_SEQUENCE:
                 parts = rel_norm.split("/")
                 case_name = parts[0] if len(parts) > 1 else "Root"
-                # [修复] 搜索已有掩码（含 NIfTI），而非硬编码 .png
+                # [修复] self.mask_root 在 _commit_task_context 之前可能为空，
+                # 用 base_dir 兜底，避免拼出相对路径导致 NIfTI 掩码找不到
+                mask_root_for_task = self.mask_root if self.mask_root else base_dir
                 mask_path = self._resolve_ct_mask_path(
-                    full_src, self.mask_root, rel_norm
+                    full_src, mask_root_for_task, rel_norm
                 )
                 filename = rel_norm
             else:
@@ -904,7 +1786,10 @@ class DataMixin:
                 has_pneumothorax=has_pneumo,
             )
             entries.append(entry)
-            task_key_map[entry.orig_path] = rel_path
+            # [修复] task_key_map 的 value 使用规范化后的 key（正斜杠、去掉前导"/"），
+            # 与 _labels_cache 的 key 格式保持一致，避免下游查询/写入时反斜杠导致的
+            # 键不匹配问题（Windows 上尤其常见）。
+            task_key_map[entry.orig_path] = rel_str
 
         return entries, missing, task_key_map
 
@@ -928,6 +1813,61 @@ class DataMixin:
 
         self.task_mode = True
         self._init_labels_cache()
+
+        # [修复] 旧方案 flush 写回任务 JSON，_build_task_entries 读 JSON 得到最新值；
+        # SQLite 方案 flush 只写 DB，JSON 不再更新，重启后 entry.has_pneumothorax
+        # 会停留在原始 JSON 值。这里用 _labels_cache（来自 SQLite）覆盖，确保一致。
+        for entry in self.task_entries:
+            raw_key = self.task_key_map.get(entry.orig_path)
+            if raw_key is not None:
+                norm_key = str(raw_key).replace("\\", "/")
+                if norm_key in self._labels_cache:
+                    entry.has_pneumothorax = int(self._labels_cache[norm_key])
+
+    def _build_task_case_lists(self):
+        """根据 task_case_entries 重建任务模式下的左右病例列表。"""
+        self.list_annotated.clear()
+        self.list_todo.clear()
+        status_map = self._load_case_status()
+
+        for case_name in self.task_case_order:
+            case_entries = self.task_case_entries.get(case_name, [])
+            if not case_entries:
+                continue
+
+            # 病例是否阳性：只要有一张 has_pneumothorax == 1
+            has_pneumo = any(e.has_pneumothorax == 1 for e in case_entries)
+
+            # 病例是否完成：优先用 case_status，缺省时回退到 has_mask
+            completed_flags: list[bool] = []
+            for entry in case_entries:
+                key = self.task_key_map.get(entry.orig_path)
+                if key and key in status_map:
+                    completed_flags.append(status_map.get(key) == "completed")
+                else:
+                    completed_flags.append(entry.has_mask)
+            is_completed = all(completed_flags) if completed_flags else False
+
+            item = QListWidgetItem(case_name)
+            item.setData(Qt.UserRole, case_name)
+            if has_pneumo:
+                item.setForeground(QColor("#ff5555"))
+
+            if is_completed:
+                self.list_annotated.addItem(item)
+            else:
+                self.list_todo.addItem(item)
+
+        # 自动选中一个病例并加载
+        target_list = None
+        if self.list_todo.count() > 0:
+            target_list = self.list_todo
+        elif self.list_annotated.count() > 0:
+            target_list = self.list_annotated
+
+        if target_list is not None:
+            target_list.setCurrentRow(0)
+            self.load_case_sequence(target_list.currentItem())
 
     # ------------------------------------------------------------------
     # load_task_json：协调函数（唯一允许碰 UI 的入口）
@@ -955,6 +1895,10 @@ class DataMixin:
         self._commit_task_context(json_path, base_dir, entries, task_key_map)
         self._build_task_case_lists()
 
+        # 任务模式 UI 初始化
+        if hasattr(self, "_refresh_task_progress_ui"):
+            self._refresh_task_progress_ui()
+
         if missing:
             sample = "\n".join(missing[:8])
             QMessageBox.warning(
@@ -980,40 +1924,38 @@ class DataMixin:
         self._cancel_pending_scan()
         self.statusBar().showMessage("扫描已取消", 2000)
 
-    def _build_task_case_lists(self):
+    def exit_task_mode(self):
+        # 1) 强制写盘标签缓存，避免防抖丢最后一批
+        if hasattr(self, "_flush_labels_cache"):
+            self._flush_labels_cache(force=True)
+
+        # 2) 不在任务模式直接提示
+        if not getattr(self, "task_mode", False):
+            QMessageBox.information(self, "提示", "当前不在任务模式。")
+            return
+
+        # 3) 清理任务相关字段
+        self.task_mode = False
+        self.task_json_path = ""
+        self.task_entries = []
+        self.task_case_entries.clear()
+        self.task_case_order.clear()
+        self.task_key_map.clear()
+
+        # 4) 清空 UI 列表及当前病例状态
         self.list_annotated.clear()
         self.list_todo.clear()
-        status_map = self._load_case_status()
+        self.entries.clear()
+        self.current_idx = -1
+        self.thumbnail_strip.clear()
+        if hasattr(self, "current_case_name"):
+            self.current_case_name = ""
 
-        for case_name in self.task_case_order:
-            case_entries = self.task_case_entries.get(case_name, [])
-            if not case_entries:
-                continue
-            has_pneumo = any(e.has_pneumothorax == 1 for e in case_entries)
-            completed_flags = []
-            for entry in case_entries:
-                key = self.task_key_map.get(entry.orig_path)
-                if key and key in status_map:
-                    completed_flags.append(status_map.get(key) == "completed")
-                else:
-                    completed_flags.append(entry.has_mask)
-            is_completed = all(completed_flags) if completed_flags else False
+        QMessageBox.information(self, "提示", "已退出任务模式，请重新扫描影像目录。")
 
-            item = QListWidgetItem(case_name)
-            item.setData(Qt.UserRole, case_name)
-            if has_pneumo:
-                item.setForeground(QColor("#ff5555"))
-            if is_completed:
-                self.list_annotated.addItem(item)
-            else:
-                self.list_todo.addItem(item)
-
-        if self.list_todo.count() > 0:
-            self.list_todo.setCurrentRow(0)
-            self.load_case_sequence(self.list_todo.currentItem())
-        elif self.list_annotated.count() > 0:
-            self.list_annotated.setCurrentRow(0)
-            self.load_case_sequence(self.list_annotated.currentItem())
+        # 5) 刷新标题/状态栏/分组标题
+        if hasattr(self, "_refresh_task_progress_ui"):
+            self._refresh_task_progress_ui()
 
     def _internal_scan_worker(
         self, token, scan_mode, orig_root, mask_root, status_map, result_queue
@@ -1311,9 +2253,10 @@ class DataMixin:
             if img_thumb is None:
                 return QIcon()
             if entry.has_mask and os.path.exists(entry.mask_path):
+                # [修复] 与 _read_entry_from_disk 对齐：NIfTI 掩码始终跳过物理空间
+                # 重采样，只按 target_shape 对齐，避免 spacing 不一致导致的放大。
                 mask_is_nifti = entry.mask_path.lower().endswith((".nii", ".nii.gz"))
-                orig_is_dicom = entry.orig_path.lower().endswith((".dcm", ".dicom"))
-                ref_path = None if (mask_is_nifti and orig_is_dicom) else entry.orig_path
+                ref_path = None if mask_is_nifti else entry.orig_path
 
                 mask_img, _ = read_mask_file(
                     entry.mask_path,
@@ -1461,6 +2404,7 @@ class DataMixin:
         target_list = None
         new_status = ""
 
+        # 1) 先确定当前操作来源列表和目标列表（保持原有逻辑）
         if self.list_todo.hasFocus():
             current_list = self.list_todo
             target_list = self.list_annotated
@@ -1478,35 +2422,100 @@ class DataMixin:
                 current_list = self.list_annotated
                 target_list = self.list_todo
                 new_status = "todo"
-            else:
+
+        if current_list is None:
+            self.statusBar().showMessage("未选中任何病例", 1000)
+            return
+
+        # 2) 获取当前列表中所有选中病例；若无选中则退回到 currentItem
+        selected_items = current_list.selectedItems()
+        if not selected_items:
+            item = current_list.currentItem()
+            if not item:
                 self.statusBar().showMessage("未选中任何病例", 1000)
                 return
+            selected_items = [item]
 
-        item = current_list.currentItem()
-        if not item:
+        # 统一使用 UserRole 作为主键，避免受到文本标记（如 [!P]）影响
+        case_names = []
+        items_by_case = {}
+        for item in selected_items:
+            case_name = item.data(Qt.UserRole)
+            if not case_name:
+                continue
+            if case_name not in items_by_case:
+                items_by_case[case_name] = []
+                case_names.append(case_name)
+            items_by_case[case_name].append(item)
+
+        if not case_names:
+            self.statusBar().showMessage("未选中任何病例", 1000)
             return
 
-        case_name = item.data(Qt.UserRole)
         if self.task_mode:
-            self._save_task_case_status(case_name, new_status)
-            self._build_task_case_lists()
+            # [修复] 直接在 UI 中移动 item，不调 _build_task_case_lists，
+            # 避免整表重建后强制跳回 row 0，破坏标注位置。
+            first_row = current_list.row(selected_items[0]) if selected_items else 0
+            moved_items = []
+            for item in selected_items:
+                case_name = item.data(Qt.UserRole)
+                if not case_name:
+                    continue
+                self._save_task_case_status(case_name, new_status)
+                row = current_list.row(item)
+                current_list.takeItem(row)
+                target_list.addItem(item)
+                moved_items.append((item, case_name))
+
+            if moved_items:
+                # 原列表仍有内容：停留在相同行号（自动加载下一个待标注病例）
+                remaining = current_list.count()
+                if remaining > 0:
+                    stay_row = min(first_row, remaining - 1)
+                    current_list.setCurrentRow(stay_row)
+                else:
+                    # 原列表已清空：把焦点移到目标列表的最后一个被移入项
+                    target_list.setCurrentItem(moved_items[-1][0])
+
             msg = (
-                "已归档至 [已完成]"
-                if new_status == "completed"
-                else "已退回至 [待标注]"
+                "已归档至 [已完成]" if new_status == "completed" else "已退回至 [待标注]"
             )
-            self.statusBar().showMessage(f"{msg}: {case_name}", 2000)
-            return
+            if len(moved_items) == 1:
+                self.statusBar().showMessage(f"{msg}: {moved_items[0][1]}", 2000)
+            else:
+                self.statusBar().showMessage(f"{msg}: {len(moved_items)} 个病例", 2000)
+        else:
+            # 普通扫描模式：批量移动 UI 中的条目并写入 case_status.json
+            moved_items = []
+            for item in selected_items:
+                case_name = item.data(Qt.UserRole)
+                if not case_name:
+                    continue
+                row = current_list.row(item)
+                current_list.takeItem(row)
+                target_list.addItem(item)
+                moved_items.append((item, case_name))
 
-        row = current_list.row(item)
-        current_list.takeItem(row)
-        target_list.addItem(item)
-        target_list.setCurrentItem(item)
+                self._save_single_case_status(case_name, new_status)
 
-        self._save_single_case_status(case_name, new_status)
+            if moved_items:
+                # 将焦点放到最后一个移动的病例上
+                target_list.setCurrentItem(moved_items[-1][0])
 
-        msg = "已归档至 [已完成]" if new_status == "completed" else "已退回至 [待标注]"
-        self.statusBar().showMessage(f"{msg}: {case_name}", 2000)
+            msg = (
+                "已归档至 [已完成]" if new_status == "completed" else "已退回至 [待标注]"
+            )
+            if len(moved_items) == 1:
+                self.statusBar().showMessage(
+                    f"{msg}: {moved_items[0][1]}", 2000
+                )
+            elif len(moved_items) > 1:
+                self.statusBar().showMessage(
+                    f"{msg}: {len(moved_items)} 个病例", 2000
+                )
+
+        if hasattr(self, "_refresh_task_progress_ui"):
+            self._refresh_task_progress_ui()
 
     def export_task_json(self):
         if self.task_mode:

@@ -44,6 +44,149 @@ def load_json_mapping(json_path: Path) -> Dict[str, int]:
     return {str(k): parse_label_value(v) for k, v in data.items()}
 
 
+# ======================================================================
+# 空掩码检测：读取现有掩码文件，判断其内容是否全零（无任何标注像素）
+# ======================================================================
+
+def detect_empty_masks(
+    mask_paths: List[str],
+    progress_cb=None,
+    cancel_cb=None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """扫描掩码文件列表，返回 (empty_list, error_list)。
+
+    - empty_list: 内容全零的掩码条目，每项为 {path, size_bytes}
+    - error_list: 读取失败的条目，每项为 {path, error}
+
+    参数:
+        mask_paths: 待检测的掩码文件绝对路径列表。
+        progress_cb: 可选回调 progress_cb(done, total)，用于 UI 进度更新。
+        cancel_cb:   可选回调 cancel_cb() -> bool，返回 True 表示请求取消。
+
+    注意：懒加载 cv2 / SimpleITK，避免在非 GUI 场景下引入额外依赖。
+    """
+    import os
+
+    empty_list: List[Dict[str, Any]] = []
+    error_list: List[Dict[str, Any]] = []
+
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+    except Exception as e:
+        error_list.append({"path": "(imports)", "error": f"cv2/numpy 缺失: {e}"})
+        return empty_list, error_list
+
+    _sitk = None
+
+    def _path_has_non_ascii(p: str) -> bool:
+        try:
+            p.encode("ascii")
+            return False
+        except UnicodeEncodeError:
+            return True
+
+    def _read_nifti_array_safe(path: str):
+        """读 NIfTI 数组；路径含非 ASCII 时先复制到临时 ASCII 路径。
+
+        这是 Windows 上 SimpleITK C++ ImageFileReader 的已知限制：
+        narrow-char 路径无法识别中文/日文/韩文等字符。
+        """
+        nonlocal _sitk
+        if _sitk is None:
+            import SimpleITK as _sitk_mod  # type: ignore
+            _sitk = _sitk_mod
+
+        if not _path_has_non_ascii(path):
+            img = _sitk.ReadImage(path)
+            return _sitk.GetArrayFromImage(img)
+
+        import shutil as _shutil
+        import tempfile as _tempfile
+        lower = path.lower()
+        if lower.endswith(".nii.gz"):
+            suffix = ".nii.gz"
+        elif lower.endswith(".nii"):
+            suffix = ".nii"
+        else:
+            suffix = os.path.splitext(path)[1] or ".nii"
+
+        tmp_dir = _tempfile.mkdtemp(prefix="sitk_ascii_scan_")
+        try:
+            tmp_path = os.path.join(tmp_dir, "mask" + suffix)
+            _shutil.copy2(path, tmp_path)
+            img = _sitk.ReadImage(tmp_path)
+            return _sitk.GetArrayFromImage(img)
+        finally:
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    total = len(mask_paths)
+    for i, p in enumerate(mask_paths):
+        if cancel_cb and cancel_cb():
+            break
+        if progress_cb:
+            try:
+                progress_cb(i, total)
+            except Exception:
+                pass
+
+        try:
+            if not p or not os.path.isfile(p):
+                error_list.append({"path": p, "error": "文件不存在"})
+                continue
+
+            size_bytes = os.path.getsize(p)
+            lower = p.lower()
+
+            if lower.endswith((".nii", ".nii.gz")):
+                try:
+                    arr = _read_nifti_array_safe(p)
+                except ImportError as e:
+                    error_list.append({"path": p, "error": f"SimpleITK 缺失: {e}"})
+                    continue
+                except Exception as e:
+                    error_list.append({"path": p, "error": f"NIfTI 读取失败: {e}"})
+                    continue
+            else:
+                # PNG / BMP / JPG 等位图：用 unicode-safe 的 imdecode
+                try:
+                    buf = np.fromfile(p, dtype=np.uint8)
+                    if buf.size == 0:
+                        error_list.append({"path": p, "error": "空文件"})
+                        continue
+                    arr = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+                except Exception as e:
+                    error_list.append({"path": p, "error": f"位图读取失败: {e}"})
+                    continue
+                if arr is None:
+                    error_list.append({"path": p, "error": "位图解码失败"})
+                    continue
+
+            if arr is None or getattr(arr, "size", 0) == 0:
+                error_list.append({"path": p, "error": "数组为空"})
+                continue
+
+            # 多通道（RGBA / RGB）：任意通道非零即视为有内容
+            try:
+                max_val = float(arr.max())
+            except Exception as e:
+                error_list.append({"path": p, "error": f"无法计算最大值: {e}"})
+                continue
+
+            if max_val <= 0.0:
+                empty_list.append({"path": p, "size_bytes": int(size_bytes)})
+        except Exception as e:
+            error_list.append({"path": p, "error": f"未知错误: {e}"})
+
+    if progress_cb:
+        try:
+            progress_cb(total, total)
+        except Exception:
+            pass
+
+    return empty_list, error_list
+
+
 def find_mask_pngs(root: Path, rel_key: str) -> List[Path]:
     """
     对于 key=.../IM0，寻找可能的掩码文件：
