@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRY = ROOT / "app.py"
-ICON = ROOT / "icon1.ico"
+ICON = ROOT / "assets" / "icon.ico"
 
 
 def build(onefile: bool = False) -> None:
