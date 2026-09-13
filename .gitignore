@@ -1,6 +1,5 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
-simcse/__pycache__/
 *.py[cod]
 *$py.class
 
@@ -10,19 +9,10 @@ simcse/__pycache__/
 # Distribution / packaging
 .Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
+.eggs/
+wheels/
 *.egg
 MANIFEST
 
@@ -30,19 +20,14 @@ MANIFEST
 *.manifest
 *.spec
 
-# Unit test / coverage reports
+# Test / coverage output
 htmlcov/
-.tox/
-.nox/
 .coverage
 .coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
 .pytest_cache/
+.hypothesis/
+.tox/
+.nox/
 
 # Environments
 .env
@@ -50,8 +35,6 @@ coverage.xml
 env/
 venv/
 ENV/
-env.bak/
-venv.bak/
 
 # Editor / OS
 .DS_Store
@@ -79,13 +62,13 @@ pneumothorax_labels.json
 case_status.json
 *_case_status.json
 
-# Medical image / annotation data: never commit real patient data
+# Medical image / annotation data
 *.dcm
 *.dicom
 *.nii
 *.nii.gz
 DICOMDIS/
 
-# Local/generated files
+# Local / generated files
 result/
-test/_tmp/
+tests/_tmp/
