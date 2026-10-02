@@ -1,180 +1,165 @@
 # PTX Annotation
 
-面向胸部 X 光与 CT 气胸数据的桌面标注、复核与掩码管理工具，基于 PySide6 构建，支持 DICOM、PNG 与 NIfTI 工作流。
+A desktop tool for annotating, reviewing, and managing pneumothorax masks in chest X-ray and CT datasets. Built with PySide6, it supports DICOM, PNG, and NIfTI workflows.
 
-## 功能
+## Features
 
-- CT 序列与 X 光单图两种工作模式
-- DICOM 读取、窗宽窗位显示与快速预览
-- PNG / NIfTI 掩码读取、编辑、保存与导出
-- 画笔、橡皮、多边形、撤销 / 重做
-- 病例搜索、任务 JSON、完成状态与标签管理
-- 图像缓存、序列预取与跨病例预取
-- PA 位筛选、掩码审计与标签清洗工具
-- SQLite 元数据持久化
+- CT sequence and single X-ray modes
+- DICOM loading, window width/level display, and quick preview
+- PNG / NIfTI mask loading, editing, saving, and export
+- Brush, eraser, polygon, undo, and redo
+- Case search, task JSON, completion status, and label management
+- Image caching, sequence prefetching, and cross-case prefetching
+- PA-view filtering, mask auditing, and label cleanup tools
+- SQLite metadata persistence
 
-## 环境安装
+## Installation
 
-推荐 Python 3.10 或 3.11。
+Python 3.10 or 3.11 is recommended.
 
 ```bash
 python -m venv .venv
 ```
 
-Windows：
+Windows:
 
 ```bash
 .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-macOS / Linux：
+macOS / Linux:
 
 ```bash
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 启动
+## Launch
 
 ```bash
 python app.py
 ```
 
-也可以直接传入影像文件进行快速预览：
+You can also pass an image file directly for a quick preview:
 
 ```bash
 python app.py path/to/image.dcm
 ```
 
-## 基本使用
+## Basic Usage
 
-1. 在工具栏选择 `CT SEQUENCE` 或 `X-RAY SINGLE`。
-2. 通过“文件 -> 加载”选择原图目录，需要时选择掩码目录。
-3. 扫描病例后，从左侧病例列表进入目标病例。
-4. 使用画笔、橡皮或多边形工具修订掩码。
-5. 使用 `Ctrl+S` 保存；开启自动保存后，切换病例时会自动写回。
-6. 使用 `T / F` 设置当前病例的气胸阳性 / 阴性标签。
+1. Select `CT SEQUENCE` or `X-RAY SINGLE` in the toolbar.
+2. Use **File → Load** to select the source image directory and, if needed, a mask directory.
+3. After scanning cases, open the desired case from the list on the left.
+4. Edit masks with the brush, eraser, or polygon tool.
+5. Press `Ctrl+S` to save. With autosave enabled, changes are saved when switching cases.
+6. Press `T / F` to mark the current case as pneumothorax-positive / negative.
 
-常用快捷键：
+Common keyboard shortcuts:
 
-| 快捷键 | 功能 |
+| Shortcut | Action |
 | --- | --- |
-| `1 / 2 / 3` | 画笔 / 橡皮 / 多边形 |
-| `A / D` | 上一张 / 下一张 |
-| `W / S` | 上一病例 / 下一病例 |
-| `Ctrl+S` | 保存掩码 |
-| `Ctrl+Z / Ctrl+Y` | 撤销 / 重做 |
-| `Ctrl+F` | 搜索病例 |
-| `T / F` | 阳性 / 阴性标签 |
+| `1 / 2 / 3` | Brush / eraser / polygon |
+| `A / D` | Previous / next image |
+| `W / S` | Previous / next case |
+| `Ctrl+S` | Save mask |
+| `Ctrl+Z / Ctrl+Y` | Undo / redo |
+| `Ctrl+F` | Search cases |
+| `T / F` | Positive / negative label |
 
-## 项目结构
+## Repository Structure
 
 ```text
 PTX-Annotation/
-├── app.py                  # 程序入口
-├── app_config.py           # 应用名称、版本与性能默认配置
-├── main_window.py          # 主窗口与共享运行状态
-├── ui_mixin.py             # UI、菜单、快捷键、病例搜索
-├── actions_mixin.py        # 保存、导出、导航与交互动作
-├── data_mixin.py           # 扫描、加载、缓存、预取与 SQLite
-├── canvas.py               # 图像 / 掩码绘制画布
-├── widgets.py              # 对话框与复合控件
-├── models.py               # 核心数据模型与枚举
-├── constants.py            # 文件格式、扩展名与路径规则
-├── utils.py                # DICOM / OpenCV / NIfTI 通用 I/O
-├── icons.py                # 界面图标生成
-├── tools/                  # 独立业务工具
+├── app.py                  # Application entry point
+├── app_config.py           # App name, version, and performance defaults
+├── main_window.py          # Main window and shared runtime state
+├── ui_mixin.py             # UI, menus, shortcuts, and case search
+├── actions_mixin.py        # Save, export, navigation, and interactions
+├── data_mixin.py           # Scanning, loading, caching, prefetching, and SQLite
+├── canvas.py               # Image and mask rendering canvas
+├── widgets.py              # Dialogs and composite widgets
+├── models.py               # Core data models and enumerations
+├── constants.py            # File formats, extensions, and path rules
+├── utils.py                # Shared DICOM / OpenCV / NIfTI I/O
+├── icons.py                # UI icon generation
+├── tools/                  # Standalone workflow tools
 │   ├── case_search.py
 │   ├── mask_audit.py
 │   └── pa_filter.py
-├── tests/                  # 自动化测试
-├── docs/                   # 设计与排障文档
-├── assets/                 # 程序资源
-├── scripts/                # 构建与维护脚本
+├── tests/                  # Automated tests
+├── docs/                   # Design and troubleshooting documentation
+├── assets/                 # Application assets
+├── scripts/                # Build and maintenance scripts
 ├── requirements.txt
 └── requirements-dev.txt
 ```
 
-## 程序架构
+## Application Architecture
 
-```text
-                    app.py
-                      |
-                      v
-               MedicalLabelPro
-                      |
-        +-------------+-------------+
-        |             |             |
-        v             v             v
-    UiMixin       DataMixin     ActionsMixin
-        |             |             |
-        |             |             +---- 保存 / 导出 / 导航
-        |             +------------------ 扫描 / 缓存 / 预取 / SQLite
-        +-------------------------------- UI / 菜单 / 快捷键
-                      |
-                      v
-                    Canvas
-                      |
-                      v
-             图像显示与掩码编辑
+```mermaid
+flowchart TB
+    App["app.py"] --> Main["MedicalLabelPro"]
+    Main --> UI["UiMixin"]
+    Main --> Data["DataMixin"]
+    Main --> Actions["ActionsMixin"]
+    UI --> UIWork["UI, menus, and shortcuts"]
+    Data --> DataWork["Scanning, caching, prefetching, and SQLite"]
+    Actions --> ActionWork["Save, export, and navigation"]
+    Main --> Canvas["Canvas"]
+    Canvas --> Editing["Image display and mask editing"]
 ```
 
-数据流：
+Data flow:
 
-```text
-影像目录 / 任务 JSON
-        |
-        v
-   病例扫描与解析
-        |
-        v
-    ImageEntry
-        |
-        +------> 图像缓存 / 后台预取 ------> Canvas
-        |
-        +------> SQLite 状态与标签
-        |
-        +------> 掩码读取 / 保存 / 导出
+```mermaid
+flowchart TB
+    Input["Image directories / task JSON"] --> Scan["Case scanning and parsing"]
+    Scan --> Entry["ImageEntry"]
+    Entry --> Cache["Image cache / background prefetch"]
+    Cache --> Canvas["Canvas"]
+    Entry --> DB["SQLite state and labels"]
+    Entry --> Masks["Mask loading / saving / export"]
 ```
 
-当前结构采用 Mixin 组合已有业务能力。后续如果继续扩大项目，优先将扫描、缓存、预取和元数据存储逐步抽成独立 service，而不是继续扩大单个 Mixin 文件。
+The current structure composes existing functionality through mixins. As the project grows, scanning, caching, prefetching, and metadata storage should gradually move into independent services to keep individual mixin files manageable.
 
-## 测试
+## Testing
 
-安装开发依赖：
+Install development dependencies:
 
 ```bash
 pip install -r requirements-dev.txt
 ```
 
-运行测试：
+Run tests:
 
 ```bash
 pytest -q
 ```
 
-## 打包
+## Packaging
 
-推荐使用仓库中的统一构建脚本：
+Use the repository's shared build script:
 
 ```bash
 python scripts/build.py
 ```
 
-默认生成 `onedir` 版本，输出目录：
+The default is an `onedir` build, written to:
 
 ```text
 dist/PTX-Annotation/
 ```
 
-如需单文件：
+For a single-file build:
 
 ```bash
 python scripts/build.py --onefile
 ```
 
-也可以直接调用 PyInstaller：
+You can also invoke PyInstaller directly:
 
 ```bash
 pyinstaller --noconfirm --clean --windowed --onedir \
@@ -183,10 +168,10 @@ pyinstaller --noconfirm --clean --windowed --onedir \
   app.py
 ```
 
-对于 PySide6、SimpleITK、OpenCV 这类依赖较多的桌面程序，优先推荐 `onedir`，更容易定位动态库或插件缺失问题。
+For desktop applications with dependencies such as PySide6, SimpleITK, and OpenCV, `onedir` is recommended because missing shared libraries or plugins are easier to diagnose.
 
-## 数据与隐私
+## Data and Privacy
 
-仓库只用于程序代码与脱敏测试逻辑，不应提交真实医疗影像、患者信息、任务运行数据库或本地标注产物。
+This repository is intended for application code and de-identified test logic. Do not commit real medical images, patient information, task databases, or local annotation outputs.
 
-`.gitignore` 已屏蔽常见 DICOM / NIfTI 数据、SQLite 运行状态、缓存和构建产物。公开仓库提交前仍建议人工检查待提交文件。
+`.gitignore` excludes common DICOM / NIfTI data, SQLite runtime state, caches, and build outputs. Manually inspect staged files before committing to a public repository.
